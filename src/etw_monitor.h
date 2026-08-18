@@ -47,19 +47,18 @@ public:
     void Stop();
 
     bool running() const noexcept;
-    std::uint64_t events_lost() const noexcept;
+    std::uint64_t events_lost() const;
     std::uint64_t parse_failures() const noexcept;
     ULONG last_error() const noexcept;
 
 private:
     static void WINAPI EventRecordCallback(EVENT_RECORD* record);
-    static ULONG WINAPI BufferCallback(EVENT_TRACE_LOGFILEW* log_file);
 
     void Consume(TRACEHANDLE trace_handle);
     void HandleEvent(const EVENT_RECORD& record);
     void CloseOwnedResources();
     void StopOwnedSessionLocked();
-    void SetLastErrorIfEmpty(ULONG error) noexcept;
+    void SetLastErrorIfEmpty(ULONG error) const noexcept;
     EVENT_TRACE_PROPERTIES* properties() noexcept;
 
     TrafficAggregator& aggregator_;
@@ -68,6 +67,7 @@ private:
     EtwDecoder decoder_;
 
     mutable std::mutex lifecycle_mutex_;
+    mutable std::mutex api_mutex_;
     std::wstring session_name_;
     std::vector<std::byte> properties_buffer_;
     EVENT_TRACE_LOGFILEW log_file_{};
@@ -77,6 +77,6 @@ private:
 
     std::atomic_bool running_{};
     std::atomic_bool cleanup_started_{};
-    std::atomic_uint64_t events_lost_{};
-    std::atomic<ULONG> last_error_{};
+    mutable std::atomic_uint64_t events_lost_{};
+    mutable std::atomic<ULONG> last_error_{};
 };

@@ -11,6 +11,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -67,6 +68,7 @@ class FakeEtwSessionApi final : public IEtwSessionApi {
 public:
     ULONG StartTraceW(TRACEHANDLE* session_handle, LPCWSTR session_name,
                       EVENT_TRACE_PROPERTIES* properties) override {
+        std::lock_guard lock(mutex);
         ++start_trace_calls;
         started_name = session_name;
         properties_guid = properties->Wnode.Guid;
@@ -75,6 +77,11 @@ public:
         log_file_mode = properties->LogFileMode;
         enable_flags = properties->EnableFlags;
         calls.emplace_back("start");
+        close_requested = false;
+        query_started = false;
+        allow_query = false;
+        worker_action_finished = false;
+        worker_action_threw = false;
         if (start_status == ERROR_SUCCESS) {
             *session_handle = session_handle_to_return;
         }
@@ -82,13 +89,12 @@ public:
     }
 
     TRACEHANDLE OpenTraceW(EVENT_TRACE_LOGFILEW* log_file) override {
+        std::lock_guard lock(mutex);
         ++open_trace_calls;
         opened_name = log_file->LoggerName;
         open_mode = log_file->ProcessTraceMode;
         opened_context = log_file->Context;
         has_event_callback = log_file->EventRecordCallback != nullptr;
-        has_buffer_callback = log_file->BufferCallback != nullptr;
-        opened_log_file = log_file;
         calls.emplace_back("open");
         if (trace_handle_to_return == INVALID_PROCESSTRACE_HANDLE) {
             SetLastError(open_error);
@@ -97,21 +103,29 @@ public:
     }
 
     ULONG ProcessTrace(TRACEHANDLE*, ULONG, FILETIME*, FILETIME*) override {
-        EVENT_TRACE_LOGFILEW* log_file = nullptr;
+        std::function<void()> action;
         {
             std::lock_guard lock(mutex);
-            log_file = opened_log_file;
+            ++process_trace_calls;
+            calls.emplace_back("process");
+            action = process_trace_action;
+            condition.notify_all();
         }
-        if (events_lost_to_report != 0 && log_file != nullptr &&
-            log_file->BufferCallback != nullptr) {
-            log_file->EventsLost = events_lost_to_report;
-            log_file->BufferCallback(log_file);
+
+        if (action) {
+            bool threw = false;
+            try {
+                action();
+            } catch (...) {
+                threw = true;
+            }
+            std::lock_guard lock(mutex);
+            worker_action_threw = threw;
+            worker_action_finished = true;
+            condition.notify_all();
         }
 
         std::unique_lock lock(mutex);
-        ++process_trace_calls;
-        calls.emplace_back("process");
-        condition.notify_all();
         if (block_process_trace) {
             condition.wait_for(lock, std::chrono::seconds(2),
                                [this] { return close_requested; });
@@ -130,26 +144,74 @@ public:
     }
 
     ULONG ControlTraceW(TRACEHANDLE session_handle, LPCWSTR session_name,
-                        EVENT_TRACE_PROPERTIES*, ULONG control_code) override {
-        std::lock_guard lock(mutex);
-        ++control_trace_calls;
+                        EVENT_TRACE_PROPERTIES* properties, ULONG control_code) override {
+        std::unique_lock lock(mutex);
+        if (control_code == EVENT_TRACE_CONTROL_QUERY) {
+            ++control_query_calls;
+            queried_session_handle = session_handle;
+            queried_name = session_name;
+            calls.emplace_back("control-query");
+            query_started = true;
+            condition.notify_all();
+            if (block_query) {
+                condition.wait(lock, [this] { return allow_query; });
+            }
+            properties->EventsLost = query_events_lost;
+            properties->RealTimeBuffersLost = query_real_time_buffers_lost;
+            return ERROR_SUCCESS;
+        }
+
+        ++control_stop_calls;
         controlled_session_handle = session_handle;
         controlled_name = session_name;
         controlled_code = control_code;
-        calls.emplace_back("control");
+        calls.emplace_back("control-stop");
         return control_status;
     }
 
-    bool WaitForConsumer() {
+    bool WaitForConsumers(int expected = 1) {
         std::unique_lock lock(mutex);
         return condition.wait_for(lock, std::chrono::seconds(2),
-                                  [this] { return process_trace_calls != 0; });
+                                  [this, expected] { return process_trace_calls >= expected; });
     }
 
     bool WaitForClose() {
         std::unique_lock lock(mutex);
         return condition.wait_for(lock, std::chrono::seconds(2),
                                   [this] { return close_requested; });
+    }
+
+    bool WaitForQuery() {
+        std::unique_lock lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds(2),
+                                  [this] { return query_started; });
+    }
+
+    void ReleaseQuery() {
+        std::lock_guard lock(mutex);
+        allow_query = true;
+        condition.notify_all();
+    }
+
+    bool WaitForWorkerAction() {
+        std::unique_lock lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds(2),
+                                  [this] { return worker_action_finished; });
+    }
+
+    bool WorkerActionThrew() {
+        std::lock_guard lock(mutex);
+        return worker_action_threw;
+    }
+
+    int StopCallCount() {
+        std::lock_guard lock(mutex);
+        return control_stop_calls;
+    }
+
+    void SetProcessTraceAction(std::function<void()> action) {
+        std::lock_guard lock(mutex);
+        process_trace_action = std::move(action);
     }
 
     ULONG start_status{ERROR_SUCCESS};
@@ -159,17 +221,21 @@ public:
     ULONG control_status{ERROR_SUCCESS};
     TRACEHANDLE session_handle_to_return{101};
     TRACEHANDLE trace_handle_to_return{202};
-    ULONG events_lost_to_report{};
+    ULONG query_events_lost{};
+    ULONG query_real_time_buffers_lost{};
     bool block_process_trace{true};
+    bool block_query{};
 
     int start_trace_calls{};
     int open_trace_calls{};
     int process_trace_calls{};
     int close_trace_calls{};
-    int control_trace_calls{};
+    int control_query_calls{};
+    int control_stop_calls{};
     std::wstring started_name;
     std::wstring opened_name;
     std::wstring controlled_name;
+    std::wstring queried_name;
     GUID properties_guid{};
     ULONG properties_flags{};
     ULONG client_context{};
@@ -178,17 +244,21 @@ public:
     ULONG open_mode{};
     void* opened_context{};
     bool has_event_callback{};
-    bool has_buffer_callback{};
     TRACEHANDLE closed_trace_handle{};
     TRACEHANDLE controlled_session_handle{};
+    TRACEHANDLE queried_session_handle{};
     ULONG controlled_code{};
     std::vector<std::string> calls;
 
 private:
     std::mutex mutex;
     std::condition_variable condition;
-    EVENT_TRACE_LOGFILEW* opened_log_file{};
+    std::function<void()> process_trace_action;
     bool close_requested{};
+    bool query_started{};
+    bool allow_query{};
+    bool worker_action_finished{};
+    bool worker_action_threw{};
 };
 
 #define CHECK_EQ(actual, expected)                                                   \
@@ -506,11 +576,10 @@ void TestEtwMonitorStartsOneConfiguredConsumer() {
     TrafficAggregator aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
-    api.events_lost_to_report = 7;
     EtwMonitor monitor(aggregator, process_cache, api);
 
     CHECK_EQ(monitor.Start(), true);
-    CHECK_EQ(api.WaitForConsumer(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
     CHECK_EQ(monitor.running(), true);
     CHECK_EQ(api.start_trace_calls, 1);
     CHECK_EQ(api.open_trace_calls, 1);
@@ -529,8 +598,6 @@ void TestEtwMonitorStartsOneConfiguredConsumer() {
                                 PROCESS_TRACE_MODE_EVENT_RECORD));
     CHECK_EQ(api.opened_context, static_cast<void*>(&monitor));
     CHECK_EQ(api.has_event_callback, true);
-    CHECK_EQ(api.has_buffer_callback, true);
-    CHECK_EQ(monitor.events_lost(), 7ULL);
 
     CHECK_EQ(monitor.Start(), true);
     CHECK_EQ(api.start_trace_calls, 1);
@@ -546,21 +613,21 @@ void TestEtwMonitorStopsOnlyOwnedResourcesAndStopIsIdempotent() {
     EtwMonitor monitor(aggregator, process_cache, api);
 
     CHECK_EQ(monitor.Start(), true);
-    CHECK_EQ(api.WaitForConsumer(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
     monitor.Stop();
 
     CHECK_EQ(monitor.running(), false);
-    CHECK_EQ(api.control_trace_calls, 1);
+    CHECK_EQ(api.control_stop_calls, 1);
     CHECK_EQ(api.controlled_session_handle, api.session_handle_to_return);
     CHECK_EQ(api.controlled_name, api.started_name);
     CHECK_EQ(api.controlled_code, static_cast<ULONG>(EVENT_TRACE_CONTROL_STOP));
     CHECK_EQ(api.close_trace_calls, 1);
     CHECK_EQ(api.closed_trace_handle, api.trace_handle_to_return);
-    CHECK_EQ(api.calls[api.calls.size() - 2], std::string("control"));
+    CHECK_EQ(api.calls[api.calls.size() - 2], std::string("control-stop"));
     CHECK_EQ(api.calls[api.calls.size() - 1], std::string("close"));
 
     monitor.Stop();
-    CHECK_EQ(api.control_trace_calls, 1);
+    CHECK_EQ(api.control_stop_calls, 1);
     CHECK_EQ(api.close_trace_calls, 1);
 }
 
@@ -577,7 +644,7 @@ void TestEtwMonitorExposesStartTraceFailureWithoutOpeningConsumer() {
     CHECK_EQ(api.start_trace_calls, 1);
     CHECK_EQ(api.open_trace_calls, 0);
     CHECK_EQ(api.process_trace_calls, 0);
-    CHECK_EQ(api.control_trace_calls, 0);
+    CHECK_EQ(api.control_stop_calls, 0);
     CHECK_EQ(api.close_trace_calls, 0);
 }
 
@@ -595,13 +662,13 @@ void TestEtwMonitorCleansOwnedSessionWhenOpenTraceFails() {
     CHECK_EQ(api.start_trace_calls, 1);
     CHECK_EQ(api.open_trace_calls, 1);
     CHECK_EQ(api.process_trace_calls, 0);
-    CHECK_EQ(api.control_trace_calls, 1);
+    CHECK_EQ(api.control_stop_calls, 1);
     CHECK_EQ(api.controlled_session_handle, api.session_handle_to_return);
     CHECK_EQ(api.controlled_name, api.started_name);
     CHECK_EQ(api.close_trace_calls, 0);
 
     monitor.Stop();
-    CHECK_EQ(api.control_trace_calls, 1);
+    CHECK_EQ(api.control_stop_calls, 1);
     CHECK_EQ(api.close_trace_calls, 0);
 }
 
@@ -617,11 +684,11 @@ void TestEtwMonitorCleansOwnedResourcesWhenConsumerFails() {
     CHECK_EQ(api.WaitForClose(), true);
     CHECK_EQ(monitor.running(), false);
     CHECK_EQ(monitor.last_error(), static_cast<ULONG>(ERROR_BAD_LENGTH));
-    CHECK_EQ(api.control_trace_calls, 1);
+    CHECK_EQ(api.control_stop_calls, 1);
     CHECK_EQ(api.close_trace_calls, 1);
 
     monitor.Stop();
-    CHECK_EQ(api.control_trace_calls, 1);
+    CHECK_EQ(api.control_stop_calls, 1);
     CHECK_EQ(api.close_trace_calls, 1);
 }
 
@@ -635,11 +702,82 @@ void TestEtwMonitorDoesNotReportSuccessfulPendingStopCodesAsErrors() {
         EtwMonitor monitor(aggregator, process_cache, api);
 
         CHECK_EQ(monitor.Start(), true);
-        CHECK_EQ(api.WaitForConsumer(), true);
+        CHECK_EQ(api.WaitForConsumers(), true);
         monitor.Stop();
 
         CHECK_EQ(monitor.last_error(), static_cast<ULONG>(ERROR_SUCCESS));
     }
+}
+
+void TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop() {
+    TrafficAggregator aggregator;
+    ProcessInfoCache process_cache;
+    FakeEtwSessionApi api;
+    api.block_query = true;
+    api.query_events_lost = std::numeric_limits<ULONG>::max();
+    api.query_real_time_buffers_lost = std::numeric_limits<ULONG>::max();
+    EtwMonitor monitor(aggregator, process_cache, api);
+
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+
+    std::uint64_t loss_count = 0;
+    std::jthread query_thread([&] { loss_count = monitor.events_lost(); });
+    CHECK_EQ(api.WaitForQuery(), true);
+
+    std::mutex stop_mutex;
+    std::condition_variable stop_condition;
+    bool stop_started = false;
+    std::jthread stop_thread([&] {
+        {
+            std::lock_guard lock(stop_mutex);
+            stop_started = true;
+            stop_condition.notify_all();
+        }
+        monitor.Stop();
+    });
+    {
+        std::unique_lock lock(stop_mutex);
+        stop_condition.wait(lock, [&] { return stop_started; });
+    }
+    CHECK_EQ(api.StopCallCount(), 0);
+
+    api.ReleaseQuery();
+    query_thread.join();
+    stop_thread.join();
+
+    CHECK_EQ(loss_count, 8589934590ULL);
+    CHECK_EQ(api.control_query_calls, 1);
+    CHECK_EQ(api.queried_session_handle, api.session_handle_to_return);
+    CHECK_EQ(api.queried_name, api.started_name);
+    CHECK_EQ(api.control_stop_calls, 1);
+    CHECK_EQ(api.close_trace_calls, 1);
+}
+
+void TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart() {
+    TrafficAggregator aggregator;
+    ProcessInfoCache process_cache;
+    FakeEtwSessionApi api;
+    EtwMonitor monitor(aggregator, process_cache, api);
+    api.SetProcessTraceAction([&] { monitor.Stop(); });
+
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForWorkerAction(), true);
+    CHECK_EQ(api.WorkerActionThrew(), false);
+    CHECK_EQ(api.control_stop_calls, 1);
+    CHECK_EQ(api.close_trace_calls, 1);
+
+    monitor.Stop();
+    CHECK_EQ(api.control_stop_calls, 1);
+    CHECK_EQ(api.close_trace_calls, 1);
+
+    api.SetProcessTraceAction({});
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(2), true);
+    CHECK_EQ(monitor.running(), true);
+    monitor.Stop();
+    CHECK_EQ(api.control_stop_calls, 2);
+    CHECK_EQ(api.close_trace_calls, 2);
 }
 
 }  // namespace
@@ -689,6 +827,8 @@ int main() {
     TestEtwMonitorCleansOwnedSessionWhenOpenTraceFails();
     TestEtwMonitorCleansOwnedResourcesWhenConsumerFails();
     TestEtwMonitorDoesNotReportSuccessfulPendingStopCodesAsErrors();
+    TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop();
+    TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart();
 
     return failures == 0 ? 0 : 1;
 }
