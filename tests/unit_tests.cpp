@@ -1,9 +1,12 @@
+#include "etw_decoder.h"
 #include "formatting.h"
 #include "process_info.h"
 #include "protocol_classifier.h"
 #include "traffic_aggregator.h"
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
@@ -97,6 +100,103 @@ void TestTrafficAggregationKeepsDistinctKeysAndDirectionsSeparate() {
     CHECK_EQ(FindSnapshot(snapshots, different_creation_time).received_bytes, 0ULL);
     CHECK_EQ(FindSnapshot(snapshots, different_transport_and_protocol).sent_bytes, 0ULL);
     CHECK_EQ(FindSnapshot(snapshots, different_transport_and_protocol).received_bytes, 400ULL);
+}
+
+void TestEtwPayloadDecodeIsBoundedAndUsesNetworkOrderPorts() {
+    const EventLayout layout{{0, 4}, {4, 4}, {8, 2}, {10, 2},
+                             TrafficDirection::Send, TransportProtocol::Tcp};
+    const std::array payload{
+        std::byte{0x78}, std::byte{0x56}, std::byte{0x34}, std::byte{0x12},
+        std::byte{0x04}, std::byte{0x03}, std::byte{0x02}, std::byte{0x01},
+        std::byte{0x12}, std::byte{0x34}, std::byte{0xAB}, std::byte{0xCD},
+    };
+
+    const auto decoded = DecodePayload(layout, payload);
+    CHECK_EQ(decoded.has_value(), true);
+    if (decoded) {
+        CHECK_EQ(decoded->pid, 0x12345678U);
+        CHECK_EQ(decoded->bytes, 0x01020304ULL);
+        CHECK_EQ(decoded->source_port, 0x1234U);
+        CHECK_EQ(decoded->destination_port, 0xABCDU);
+        CHECK_EQ(static_cast<int>(decoded->direction), static_cast<int>(TrafficDirection::Send));
+        CHECK_EQ(static_cast<int>(decoded->transport), static_cast<int>(TransportProtocol::Tcp));
+    }
+
+    CHECK_EQ(DecodePayload(layout, std::span{payload}.first(payload.size() - 1)).has_value(),
+             false);
+    CHECK_EQ(DecodePayload(layout, {}).has_value(), false);
+
+    auto missing_field = layout;
+    missing_field.pid.width = 0;
+    CHECK_EQ(DecodePayload(missing_field, payload).has_value(), false);
+
+    auto unsupported_width = layout;
+    unsupported_width.size.width = 8;
+    CHECK_EQ(DecodePayload(unsupported_width, payload).has_value(), false);
+
+    auto overflowing_offset = layout;
+    overflowing_offset.pid.offset = std::numeric_limits<std::size_t>::max();
+    CHECK_EQ(DecodePayload(overflowing_offset, payload).has_value(), false);
+}
+
+void TestEtwDecoderCachesLayoutsBySchemaKey() {
+    const EventLayout layout{{0, 4}, {4, 4}, {8, 2}, {10, 2},
+                             TrafficDirection::Receive, TransportProtocol::Udp};
+    const std::array payload{
+        std::byte{0x2A}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+        std::byte{0x40}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+        std::byte{0x00}, std::byte{0x35}, std::byte{0xC0}, std::byte{0x00},
+    };
+    int load_count = 0;
+    EtwDecoder decoder([&](const EVENT_RECORD&) -> std::optional<EventLayout> {
+        ++load_count;
+        return layout;
+    });
+
+    EVENT_RECORD record{};
+    record.EventHeader.ProviderId =
+        GUID{0xbf3a50c5, 0xa9c9, 0x4988, {0xa0, 0x05, 0x2d, 0xf0, 0xb7, 0xc8, 0x0f, 0x80}};
+    record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_RECEIVE;
+    record.EventHeader.EventDescriptor.Version = 1;
+    record.EventHeader.Flags = EVENT_HEADER_FLAG_CLASSIC_HEADER | EVENT_HEADER_FLAG_64_BIT_HEADER;
+    record.UserData = const_cast<std::byte*>(payload.data());
+    record.UserDataLength = static_cast<USHORT>(payload.size());
+
+    CHECK_EQ(decoder.Decode(record).has_value(), true);
+    CHECK_EQ(decoder.Decode(record).has_value(), true);
+    CHECK_EQ(load_count, 1);
+    CHECK_EQ(decoder.cached_layout_count(), 1U);
+
+    record.EventHeader.EventDescriptor.Version = 2;
+    CHECK_EQ(decoder.Decode(record).has_value(), true);
+    CHECK_EQ(load_count, 2);
+    CHECK_EQ(decoder.cached_layout_count(), 2U);
+    CHECK_EQ(decoder.parse_failures(), 0ULL);
+
+    record.EventHeader.Flags = EVENT_HEADER_FLAG_CLASSIC_HEADER | EVENT_HEADER_FLAG_32_BIT_HEADER;
+    CHECK_EQ(decoder.Decode(record).has_value(), true);
+    CHECK_EQ(load_count, 3);
+    CHECK_EQ(decoder.cached_layout_count(), 3U);
+}
+
+void TestEtwDecoderCachesInvalidLayoutsAndCountsEveryFailedEvent() {
+    int load_count = 0;
+    EtwDecoder decoder([&](const EVENT_RECORD&) -> std::optional<EventLayout> {
+        ++load_count;
+        return std::nullopt;
+    });
+    EVENT_RECORD record{};
+    record.EventHeader.ProviderId =
+        GUID{0x9a280ac0, 0xc8e0, 0x11d1, {0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2}};
+    record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_SEND;
+    record.EventHeader.EventDescriptor.Version = 2;
+    record.EventHeader.Flags = EVENT_HEADER_FLAG_CLASSIC_HEADER | EVENT_HEADER_FLAG_64_BIT_HEADER;
+
+    CHECK_EQ(decoder.Decode(record).has_value(), false);
+    CHECK_EQ(decoder.Decode(record).has_value(), false);
+    CHECK_EQ(load_count, 1);
+    CHECK_EQ(decoder.cached_layout_count(), 1U);
+    CHECK_EQ(decoder.parse_failures(), 2ULL);
 }
 
 void TestTrafficRatesClearAndSaturation() {
@@ -302,6 +402,9 @@ int main() {
     CHECK_EQ(ApplicationProtocolName(ApplicationProtocol::Other), L"其他");
 
     TestTrafficAggregationKeepsDistinctKeysAndDirectionsSeparate();
+    TestEtwPayloadDecodeIsBoundedAndUsesNetworkOrderPorts();
+    TestEtwDecoderCachesLayoutsBySchemaKey();
+    TestEtwDecoderCachesInvalidLayoutsAndCountsEveryFailedEvent();
     TestTrafficRatesClearAndSaturation();
     TestTrafficRatesIgnoreNonpositiveSnapshotTimes();
     TestTrafficAggregationKeepsApplicationProtocolsSeparate();

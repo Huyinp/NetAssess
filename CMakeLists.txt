@@ -18,10 +18,11 @@ if(CMAKE_GENERATOR_PLATFORM)
 endif()
 
 add_library(NetAssessCore STATIC src/protocol_classifier.cpp src/traffic_aggregator.cpp src/formatting.cpp
-                                  src/process_info.cpp)
+                                  src/process_info.cpp src/etw_decoder.cpp)
 target_include_directories(NetAssessCore PUBLIC src)
 target_compile_definitions(NetAssessCore PUBLIC _WIN32_WINNT=0x0A00 UNICODE)
 target_compile_options(NetAssessCore PRIVATE /utf-8)
+target_link_libraries(NetAssessCore PRIVATE tdh)
 
 add_executable(NetAssessTests tests/unit_tests.cpp)
 target_link_libraries(NetAssessTests PRIVATE NetAssessCore)
