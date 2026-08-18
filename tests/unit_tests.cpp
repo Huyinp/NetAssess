@@ -192,35 +192,56 @@ void TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically() {
     const TrafficKey slow{{300, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
     const TrafficKey fast{{200, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
     const TrafficKey medium{{100, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
-    std::vector<TrafficSnapshot> rows{
-        MakeSnapshot(slow, L"slow.exe", 10.0, 0.0),
-        MakeSnapshot(fast, L"fast.exe", 30.0, 0.0),
-        MakeSnapshot(medium, L"medium.exe", 20.0, 0.0),
+    std::vector<TrafficDisplayRow> rows{
+        {MakeSnapshot(slow, L"slow.exe", 10.0, 0.0), true},
+        {MakeSnapshot(fast, L"fast.exe", 30.0, 0.0), true},
+        {MakeSnapshot(medium, L"medium.exe", 20.0, 0.0), true},
     };
 
-    SortTrafficRows(rows, SortColumn::CombinedSpeed, false);
-    CHECK_EQ(rows[0].key.process.pid, fast.process.pid);
-    CHECK_EQ(rows[1].key.process.pid, medium.process.pid);
-    CHECK_EQ(rows[2].key.process.pid, slow.process.pid);
+    SortTrafficRows(rows);
+    CHECK_EQ(rows[0].traffic.key.process.pid, fast.process.pid);
+    CHECK_EQ(rows[1].traffic.key.process.pid, medium.process.pid);
+    CHECK_EQ(rows[2].traffic.key.process.pid, slow.process.pid);
 
     SortTrafficRows(rows, SortColumn::Pid, true);
-    CHECK_EQ(rows[0].key.process.pid, medium.process.pid);
-    CHECK_EQ(rows[1].key.process.pid, fast.process.pid);
-    CHECK_EQ(rows[2].key.process.pid, slow.process.pid);
+    CHECK_EQ(rows[0].traffic.key.process.pid, medium.process.pid);
+    CHECK_EQ(rows[1].traffic.key.process.pid, fast.process.pid);
+    CHECK_EQ(rows[2].traffic.key.process.pid, slow.process.pid);
 
     const TrafficKey first_alpha{{20, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
     const TrafficKey second_alpha{{30, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
     const TrafficKey bravo{{10, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
     rows = {
-        MakeSnapshot(second_alpha, L"alpha.exe", 0.0, 0.0),
-        MakeSnapshot(bravo, L"bravo.exe", 0.0, 0.0),
-        MakeSnapshot(first_alpha, L"Alpha.exe", 0.0, 0.0),
+        {MakeSnapshot(second_alpha, L"alpha.exe", 0.0, 0.0), true},
+        {MakeSnapshot(bravo, L"bravo.exe", 0.0, 0.0), true},
+        {MakeSnapshot(first_alpha, L"Alpha.exe", 0.0, 0.0), true},
     };
 
     SortTrafficRows(rows, SortColumn::ProcessName, true);
-    CHECK_EQ(rows[0].key.process.pid, first_alpha.process.pid);
-    CHECK_EQ(rows[1].key.process.pid, second_alpha.process.pid);
-    CHECK_EQ(rows[2].key.process.pid, bravo.process.pid);
+    CHECK_EQ(rows[0].traffic.key.process.pid, first_alpha.process.pid);
+    CHECK_EQ(rows[1].traffic.key.process.pid, second_alpha.process.pid);
+    CHECK_EQ(rows[2].traffic.key.process.pid, bravo.process.pid);
+
+    const TrafficKey ended{{10, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
+    const TrafficKey first_running{{20, 1}, TransportProtocol::Tcp,
+                                   ApplicationProtocol::Http};
+    const TrafficKey second_running{{30, 1}, TransportProtocol::Tcp,
+                                    ApplicationProtocol::Http};
+    rows = {
+        {MakeSnapshot(second_running, L"running-two.exe", 0.0, 0.0), true},
+        {MakeSnapshot(ended, L"ended.exe", 0.0, 0.0), false},
+        {MakeSnapshot(first_running, L"running-one.exe", 0.0, 0.0), true},
+    };
+
+    SortTrafficRows(rows, SortColumn::Status, false);
+    CHECK_EQ(rows[0].traffic.key.process.pid, first_running.process.pid);
+    CHECK_EQ(rows[1].traffic.key.process.pid, second_running.process.pid);
+    CHECK_EQ(rows[2].traffic.key.process.pid, ended.process.pid);
+
+    SortTrafficRows(rows, SortColumn::Status, true);
+    CHECK_EQ(rows[0].traffic.key.process.pid, ended.process.pid);
+    CHECK_EQ(rows[1].traffic.key.process.pid, first_running.process.pid);
+    CHECK_EQ(rows[2].traffic.key.process.pid, second_running.process.pid);
 }
 
 }  // namespace

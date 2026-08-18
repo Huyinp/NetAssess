@@ -55,31 +55,34 @@ int CompareValues(const T& left, const T& right) {
     return left < right ? -1 : left > right ? 1 : 0;
 }
 
-int CompareByColumn(const TrafficSnapshot& left, const TrafficSnapshot& right,
+int CompareByColumn(const TrafficDisplayRow& left, const TrafficDisplayRow& right,
                     SortColumn column) {
+    const TrafficSnapshot& left_traffic = left.traffic;
+    const TrafficSnapshot& right_traffic = right.traffic;
     switch (column) {
     case SortColumn::ProcessName:
-        return CompareCaseInsensitive(left.process_name, right.process_name);
+        return CompareCaseInsensitive(left_traffic.process_name, right_traffic.process_name);
     case SortColumn::Pid:
-        return CompareValues(left.key.process.pid, right.key.process.pid);
+        return CompareValues(left_traffic.key.process.pid, right_traffic.key.process.pid);
     case SortColumn::Status:
-        return 0;
+        return CompareValues(left.process_alive, right.process_alive);
     case SortColumn::Transport:
-        return CompareValues(left.key.transport, right.key.transport);
+        return CompareValues(left_traffic.key.transport, right_traffic.key.transport);
     case SortColumn::ApplicationProtocol:
-        return CompareValues(left.key.application_protocol, right.key.application_protocol);
+        return CompareValues(left_traffic.key.application_protocol,
+                             right_traffic.key.application_protocol);
     case SortColumn::SentBytes:
-        return CompareValues(left.sent_bytes, right.sent_bytes);
+        return CompareValues(left_traffic.sent_bytes, right_traffic.sent_bytes);
     case SortColumn::SentRate:
-        return CompareValues(ComparableRate(left.sent_bytes_per_second),
-                             ComparableRate(right.sent_bytes_per_second));
+        return CompareValues(ComparableRate(left_traffic.sent_bytes_per_second),
+                             ComparableRate(right_traffic.sent_bytes_per_second));
     case SortColumn::ReceivedBytes:
-        return CompareValues(left.received_bytes, right.received_bytes);
+        return CompareValues(left_traffic.received_bytes, right_traffic.received_bytes);
     case SortColumn::ReceivedRate:
-        return CompareValues(ComparableRate(left.received_bytes_per_second),
-                             ComparableRate(right.received_bytes_per_second));
+        return CompareValues(ComparableRate(left_traffic.received_bytes_per_second),
+                             ComparableRate(right_traffic.received_bytes_per_second));
     case SortColumn::CombinedSpeed:
-        return CompareValues(CombinedRate(left), CombinedRate(right));
+        return CompareValues(CombinedRate(left_traffic), CombinedRate(right_traffic));
     }
     return 0;
 }
@@ -98,13 +101,13 @@ std::wstring_view ProcessStatusText(bool alive) {
     return alive ? L"运行中" : L"已结束";
 }
 
-void SortTrafficRows(std::vector<TrafficSnapshot>& rows, SortColumn column, bool ascending) {
-    std::stable_sort(rows.begin(), rows.end(), [column, ascending](const TrafficSnapshot& left,
-                                                                    const TrafficSnapshot& right) {
+void SortTrafficRows(std::vector<TrafficDisplayRow>& rows, SortColumn column, bool ascending) {
+    std::stable_sort(rows.begin(), rows.end(), [column, ascending](const TrafficDisplayRow& left,
+                                                                    const TrafficDisplayRow& right) {
         const int comparison = CompareByColumn(left, right, column);
         if (comparison != 0) {
             return ascending ? comparison < 0 : comparison > 0;
         }
-        return left.key < right.key;
+        return left.traffic.key < right.traffic.key;
     });
 }

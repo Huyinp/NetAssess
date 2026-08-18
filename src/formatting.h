@@ -11,6 +11,11 @@ std::wstring FormatBytes(std::uint64_t bytes);
 std::wstring FormatRate(double bytes_per_second);
 std::wstring_view ProcessStatusText(bool alive);
 
+struct TrafficDisplayRow {
+    TrafficSnapshot traffic;
+    bool process_alive{};
+};
+
 enum class SortColumn {
     ProcessName,
     Pid,
@@ -24,6 +29,6 @@ enum class SortColumn {
     CombinedSpeed,
 };
 
-void SortTrafficRows(std::vector<TrafficSnapshot>& rows,
+void SortTrafficRows(std::vector<TrafficDisplayRow>& rows,
                      SortColumn column = SortColumn::CombinedSpeed,
                      bool ascending = false);
