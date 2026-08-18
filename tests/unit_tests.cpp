@@ -1,4 +1,5 @@
 #include "formatting.h"
+#include "process_info.h"
 #include "protocol_classifier.h"
 #include "traffic_aggregator.h"
 
@@ -9,6 +10,9 @@
 #include <limits>
 #include <string_view>
 #include <vector>
+
+#define NOMINMAX
+#include <windows.h>
 
 namespace {
 
@@ -244,6 +248,25 @@ void TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically() {
     CHECK_EQ(rows[2].traffic.key.process.pid, second_running.process.pid);
 }
 
+void TestProcessInfoResolvesLiveAndInaccessibleProcesses() {
+    ProcessInfoCache cache;
+
+    const auto current_process = cache.Resolve(GetCurrentProcessId(), 0);
+    CHECK_EQ(current_process.id.pid, GetCurrentProcessId());
+    CHECK_EQ(current_process.name.empty(), false);
+    CHECK_EQ(current_process.id.creation_time_100ns == 0, false);
+    CHECK_EQ(current_process.alive, true);
+    CHECK_EQ(cache.RefreshAlive(current_process.id), true);
+
+    constexpr std::uint32_t inaccessible_pid = 0xFFFFFFFFu;
+    const auto inaccessible_process = cache.Resolve(inaccessible_pid, 42);
+    CHECK_EQ(inaccessible_process.id.pid, inaccessible_pid);
+    CHECK_EQ(inaccessible_process.name, L"受限进程 (4294967295)");
+    CHECK_EQ(inaccessible_process.id.creation_time_100ns, 42ULL);
+    CHECK_EQ(inaccessible_process.alive, false);
+    CHECK_EQ(cache.RefreshAlive(inaccessible_process.id), false);
+}
+
 }  // namespace
 
 int main() {
@@ -281,6 +304,7 @@ int main() {
     TestTrafficAggregationKeepsApplicationProtocolsSeparate();
     TestTrafficFormatting();
     TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically();
+    TestProcessInfoResolvesLiveAndInaccessibleProcesses();
 
     return failures == 0 ? 0 : 1;
 }
