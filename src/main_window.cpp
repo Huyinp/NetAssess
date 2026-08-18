@@ -72,10 +72,11 @@ void AdjustWindowRectForDpi(RECT& rectangle, DWORD style, DWORD extended_style, 
 }
 
 bool ContainsCaseInsensitive(std::wstring_view value, std::wstring_view filter) {
-    return std::search(value.begin(), value.end(), filter.begin(), filter.end(),
-                       [](wchar_t left, wchar_t right) {
-                           return std::towlower(left) == std::towlower(right);
-                       }) != value.end();
+    if (filter.empty()) {
+        return true;
+    }
+    return FindStringOrdinal(FIND_FROMSTART, value.data(), static_cast<int>(value.size()),
+                             filter.data(), static_cast<int>(filter.size()), TRUE) >= 0;
 }
 
 SortColumn SortColumnForListColumn(int column) {

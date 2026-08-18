@@ -700,6 +700,21 @@ void TestVisibleRowsDefaultOrderUsesCombinedSpeedDescending() {
     CHECK_EQ(rows[2].traffic.key.process.pid, slow.process.pid);
 }
 
+void TestVisibleRowsUsesInvariantUnicodeCaseInsensitiveFilter() {
+    const TrafficKey process{{301, 44}, TransportProtocol::Tcp,
+                             ApplicationProtocol::HttpsTls};
+    const std::vector<TrafficSnapshot> snapshots{
+        MakeSnapshot(process, L"Äther.exe", 1.0, 1.0),
+    };
+
+    const auto rows = BuildVisibleRows(
+        snapshots, L"äTHER", SortColumn::CombinedSpeed, false,
+        [](ProcessInstanceId) { return true; });
+
+    CHECK_EQ(rows.size(), 1U);
+    CHECK_EQ(rows[0].traffic.key.process.pid, process.process.pid);
+}
+
 void TestProcessInfoResolvesLiveAndInaccessibleProcesses() {
     ProcessInfoCache cache;
 
@@ -973,6 +988,7 @@ int main(int argc, char** argv) {
     TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically();
     TestVisibleRowsFilterWithoutMutatingSnapshotAndAttachLiveness();
     TestVisibleRowsDefaultOrderUsesCombinedSpeedDescending();
+    TestVisibleRowsUsesInvariantUnicodeCaseInsensitiveFilter();
     TestProcessInfoResolvesLiveAndInaccessibleProcesses();
     TestEtwMonitorStartsOneConfiguredConsumer();
     TestEtwMonitorStopsOnlyOwnedResourcesAndStopIsIdempotent();
