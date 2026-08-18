@@ -121,6 +121,44 @@ void TestTrafficRatesClearAndSaturation() {
              std::numeric_limits<std::uint64_t>::max());
 }
 
+void TestTrafficRatesIgnoreNonpositiveSnapshotTimes() {
+    TrafficAggregator aggregator;
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const TrafficKey key{{100, 1}, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls};
+
+    aggregator.Add({key, L"first.exe", TrafficDirection::Send, 0});
+    aggregator.Snapshot(t0);
+    aggregator.Add({key, L"first.exe", TrafficDirection::Send, 100});
+    aggregator.Snapshot(t0 + std::chrono::seconds(2));
+
+    aggregator.Add({key, L"first.exe", TrafficDirection::Send, 200});
+    const auto equal_time_snapshots = aggregator.Snapshot(t0 + std::chrono::seconds(2));
+    CHECK_EQ(FindSnapshot(equal_time_snapshots, key).sent_bytes_per_second, 0.0);
+    const auto earlier_time_snapshots = aggregator.Snapshot(t0 + std::chrono::seconds(1));
+    CHECK_EQ(FindSnapshot(earlier_time_snapshots, key).sent_bytes_per_second, 0.0);
+
+    aggregator.Add({key, L"first.exe", TrafficDirection::Send, 100});
+    const auto later_snapshots = aggregator.Snapshot(t0 + std::chrono::seconds(5));
+    CHECK_EQ(FindSnapshot(later_snapshots, key).sent_bytes_per_second, 100.0);
+}
+
+void TestTrafficAggregationKeepsApplicationProtocolsSeparate() {
+    TrafficAggregator aggregator;
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const TrafficKey https{{100, 1}, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls};
+    const TrafficKey http{{100, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
+
+    aggregator.Add({https, L"first.exe", TrafficDirection::Send, 100});
+    aggregator.Add({http, L"first.exe", TrafficDirection::Receive, 200});
+
+    const auto snapshots = aggregator.Snapshot(t0);
+    CHECK_EQ(snapshots.size(), 2U);
+    CHECK_EQ(FindSnapshot(snapshots, https).sent_bytes, 100ULL);
+    CHECK_EQ(FindSnapshot(snapshots, https).received_bytes, 0ULL);
+    CHECK_EQ(FindSnapshot(snapshots, http).sent_bytes, 0ULL);
+    CHECK_EQ(FindSnapshot(snapshots, http).received_bytes, 200ULL);
+}
+
 }  // namespace
 
 int main() {
@@ -154,6 +192,8 @@ int main() {
 
     TestTrafficAggregationKeepsDistinctKeysAndDirectionsSeparate();
     TestTrafficRatesClearAndSaturation();
+    TestTrafficRatesIgnoreNonpositiveSnapshotTimes();
+    TestTrafficAggregationKeepsApplicationProtocolsSeparate();
 
     return failures == 0 ? 0 : 1;
 }

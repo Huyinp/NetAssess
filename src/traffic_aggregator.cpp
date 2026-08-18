@@ -25,7 +25,9 @@ void TrafficAggregator::Add(const TrafficEvent& event) {
 std::vector<TrafficSnapshot> TrafficAggregator::Snapshot(
     std::chrono::steady_clock::time_point now) {
     std::lock_guard lock(mutex_);
-    const double elapsed_seconds = previous_snapshot_time_ && now > *previous_snapshot_time_
+    const bool has_previous_snapshot = previous_snapshot_time_.has_value();
+    const bool has_valid_interval = has_previous_snapshot && now > *previous_snapshot_time_;
+    const double elapsed_seconds = has_valid_interval
                                        ? std::chrono::duration<double>(now - *previous_snapshot_time_).count()
                                        : 0.0;
     std::vector<TrafficSnapshot> snapshots;
@@ -41,12 +43,16 @@ std::vector<TrafficSnapshot> TrafficAggregator::Snapshot(
                 static_cast<double>(entry.received_bytes - entry.previous_received_bytes) /
                                                     elapsed_seconds;
         }
-        entry.previous_sent_bytes = entry.sent_bytes;
-        entry.previous_received_bytes = entry.received_bytes;
-        entry.has_previous_snapshot = true;
+        if (!has_previous_snapshot || has_valid_interval) {
+            entry.previous_sent_bytes = entry.sent_bytes;
+            entry.previous_received_bytes = entry.received_bytes;
+            entry.has_previous_snapshot = true;
+        }
         snapshots.push_back(std::move(snapshot));
     }
-    previous_snapshot_time_ = now;
+    if (!has_previous_snapshot || has_valid_interval) {
+        previous_snapshot_time_ = now;
+    }
     return snapshots;
 }
 
