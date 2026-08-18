@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <chrono>
 #include <condition_variable>
@@ -80,6 +81,8 @@ public:
         close_requested = false;
         query_started = false;
         allow_query = false;
+        worker_action_ready = false;
+        allow_worker_action = false;
         worker_action_finished = false;
         worker_action_threw = false;
         if (start_status == ERROR_SUCCESS) {
@@ -113,6 +116,14 @@ public:
         }
 
         if (action) {
+            {
+                std::unique_lock lock(mutex);
+                worker_action_ready = true;
+                condition.notify_all();
+                if (hold_worker_action) {
+                    condition.wait(lock, [this] { return allow_worker_action; });
+                }
+            }
             bool threw = false;
             try {
                 action();
@@ -176,8 +187,12 @@ public:
     }
 
     bool WaitForClose() {
+        return WaitForCloseFor(std::chrono::seconds(2));
+    }
+
+    bool WaitForCloseFor(std::chrono::milliseconds timeout) {
         std::unique_lock lock(mutex);
-        return condition.wait_for(lock, std::chrono::seconds(2),
+        return condition.wait_for(lock, timeout,
                                   [this] { return close_requested; });
     }
 
@@ -199,6 +214,18 @@ public:
                                   [this] { return worker_action_finished; });
     }
 
+    bool WaitForWorkerActionReady() {
+        std::unique_lock lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds(2),
+                                  [this] { return worker_action_ready; });
+    }
+
+    void ReleaseWorkerAction() {
+        std::lock_guard lock(mutex);
+        allow_worker_action = true;
+        condition.notify_all();
+    }
+
     bool WorkerActionThrew() {
         std::lock_guard lock(mutex);
         return worker_action_threw;
@@ -212,6 +239,11 @@ public:
     void SetProcessTraceAction(std::function<void()> action) {
         std::lock_guard lock(mutex);
         process_trace_action = std::move(action);
+    }
+
+    void HoldProcessTraceAction(bool hold) {
+        std::lock_guard lock(mutex);
+        hold_worker_action = hold;
     }
 
     ULONG start_status{ERROR_SUCCESS};
@@ -257,9 +289,79 @@ private:
     bool close_requested{};
     bool query_started{};
     bool allow_query{};
+    bool hold_worker_action{};
+    bool worker_action_ready{};
+    bool allow_worker_action{};
     bool worker_action_finished{};
     bool worker_action_threw{};
 };
+
+int RunEtwMonitorStopInterleavingChild() {
+    TrafficAggregator aggregator;
+    ProcessInfoCache process_cache;
+    FakeEtwSessionApi api;
+    EtwMonitor monitor(aggregator, process_cache, api);
+    api.HoldProcessTraceAction(true);
+    api.SetProcessTraceAction([&] { monitor.Stop(); });
+
+    if (!monitor.Start() || !api.WaitForWorkerActionReady()) {
+        return 10;
+    }
+
+    std::atomic_bool external_stop_returned{};
+    std::jthread external_stop([&] {
+        monitor.Stop();
+        external_stop_returned.store(true, std::memory_order_release);
+    });
+    if (!api.WaitForClose() || external_stop_returned.load(std::memory_order_acquire)) {
+        ExitProcess(11);
+    }
+
+    api.ReleaseWorkerAction();
+    if (!api.WaitForWorkerAction()) {
+        ExitProcess(12);
+    }
+    external_stop.join();
+    if (!external_stop_returned.load(std::memory_order_acquire) ||
+        api.control_stop_calls != 1 || api.close_trace_calls != 1) {
+        return 13;
+    }
+
+    monitor.Stop();
+    return api.control_stop_calls == 1 && api.close_trace_calls == 1 ? 0 : 14;
+}
+
+DWORD RunEtwMonitorStopInterleavingProcess() {
+    std::wstring executable(MAX_PATH, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, executable.data(),
+                                            static_cast<DWORD>(executable.size()));
+    if (length == 0 || length == executable.size()) {
+        return GetLastError();
+    }
+    executable.resize(length);
+
+    std::wstring command_line = L"\"" + executable + L"\" --etw-stop-interleaving-child";
+    std::vector<wchar_t> command_buffer(command_line.begin(), command_line.end());
+    command_buffer.push_back(L'\0');
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(nullptr, command_buffer.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+        return GetLastError();
+    }
+
+    const DWORD wait_result = WaitForSingleObject(process.hProcess, 5000);
+    DWORD exit_code = ERROR_TIMEOUT;
+    if (wait_result == WAIT_OBJECT_0) {
+        GetExitCodeProcess(process.hProcess, &exit_code);
+    } else {
+        TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+        WaitForSingleObject(process.hProcess, INFINITE);
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return exit_code;
+}
 
 #define CHECK_EQ(actual, expected)                                                   \
     do {                                                                             \
@@ -725,28 +827,21 @@ void TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop() {
     std::jthread query_thread([&] { loss_count = monitor.events_lost(); });
     CHECK_EQ(api.WaitForQuery(), true);
 
-    std::mutex stop_mutex;
-    std::condition_variable stop_condition;
-    bool stop_started = false;
+    std::atomic_bool stop_returned{};
     std::jthread stop_thread([&] {
-        {
-            std::lock_guard lock(stop_mutex);
-            stop_started = true;
-            stop_condition.notify_all();
-        }
         monitor.Stop();
+        stop_returned.store(true, std::memory_order_release);
     });
-    {
-        std::unique_lock lock(stop_mutex);
-        stop_condition.wait(lock, [&] { return stop_started; });
-    }
+    CHECK_EQ(api.WaitForCloseFor(std::chrono::milliseconds(100)), false);
     CHECK_EQ(api.StopCallCount(), 0);
+    CHECK_EQ(stop_returned.load(std::memory_order_acquire), false);
 
     api.ReleaseQuery();
     query_thread.join();
     stop_thread.join();
 
-    CHECK_EQ(loss_count, 8589934590ULL);
+    CHECK_EQ(stop_returned.load(std::memory_order_acquire), true);
+    CHECK_EQ(loss_count, 4294967295ULL);
     CHECK_EQ(api.control_query_calls, 1);
     CHECK_EQ(api.queried_session_handle, api.session_handle_to_return);
     CHECK_EQ(api.queried_name, api.started_name);
@@ -780,9 +875,17 @@ void TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart() {
     CHECK_EQ(api.close_trace_calls, 2);
 }
 
+void TestEtwMonitorExternalJoinDoesNotBlockConsumerThreadStop() {
+    CHECK_EQ(RunEtwMonitorStopInterleavingProcess(), static_cast<DWORD>(ERROR_SUCCESS));
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--etw-stop-interleaving-child") {
+        return RunEtwMonitorStopInterleavingChild();
+    }
+
     CHECK_EQ(InferApplicationProtocol(TransportProtocol::Tcp,
                                       TrafficDirection::Send, 50000, 443),
              ApplicationProtocol::HttpsTls);
@@ -829,6 +932,7 @@ int main() {
     TestEtwMonitorDoesNotReportSuccessfulPendingStopCodesAsErrors();
     TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop();
     TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart();
+    TestEtwMonitorExternalJoinDoesNotBlockConsumerThreadStop();
 
     return failures == 0 ? 0 : 1;
 }

@@ -57,6 +57,8 @@ bool IsCompletedStopResult(ULONG result) {
 
 }  // namespace
 
+thread_local EtwMonitor* EtwMonitor::current_consumer_ = nullptr;
+
 EtwMonitor::EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_cache)
     : EtwMonitor(aggregator, process_cache, DefaultSessionApi()) {}
 
@@ -69,12 +71,13 @@ EtwMonitor::~EtwMonitor() {
 }
 
 bool EtwMonitor::Start() {
-    std::lock_guard lock(lifecycle_mutex_);
+    std::lock_guard lock(transition_mutex_);
     if (running_.load(std::memory_order_acquire)) {
         return true;
     }
 
-    StopOwnedSessionLocked();
+    RequestStop();
+    FinalizeStoppedSession();
     last_error_.store(ERROR_SUCCESS, std::memory_order_relaxed);
     events_lost_.store(0, std::memory_order_relaxed);
 
@@ -130,7 +133,8 @@ bool EtwMonitor::Start() {
             open_error = ERROR_GEN_FAILURE;
         }
         last_error_.store(open_error, std::memory_order_relaxed);
-        StopOwnedSessionLocked();
+        RequestStop();
+        FinalizeStoppedSession();
         return false;
     }
 
@@ -143,7 +147,8 @@ bool EtwMonitor::Start() {
         const ULONG thread_error = static_cast<ULONG>(error.code().value());
         last_error_.store(thread_error == ERROR_SUCCESS ? ERROR_NOT_ENOUGH_MEMORY : thread_error,
                           std::memory_order_relaxed);
-        StopOwnedSessionLocked();
+        RequestStop();
+        FinalizeStoppedSession();
         return false;
     }
     return true;
@@ -151,8 +156,14 @@ bool EtwMonitor::Start() {
 
 void EtwMonitor::Stop() {
     running_.store(false, std::memory_order_release);
-    std::lock_guard lock(lifecycle_mutex_);
-    StopOwnedSessionLocked();
+    if (current_consumer_ == this) {
+        RequestStop();
+        return;
+    }
+
+    std::lock_guard lock(transition_mutex_);
+    RequestStop();
+    FinalizeStoppedSession();
 }
 
 bool EtwMonitor::running() const noexcept {
@@ -160,7 +171,7 @@ bool EtwMonitor::running() const noexcept {
 }
 
 std::uint64_t EtwMonitor::events_lost() const {
-    std::lock_guard lifecycle_lock(lifecycle_mutex_);
+    std::lock_guard transition_lock(transition_mutex_);
     if (session_handle_ == 0 || cleanup_started_.load(std::memory_order_acquire)) {
         return events_lost_.load(std::memory_order_relaxed);
     }
@@ -180,8 +191,7 @@ std::uint64_t EtwMonitor::events_lost() const {
         return events_lost_.load(std::memory_order_relaxed);
     }
 
-    const auto loss_count = static_cast<std::uint64_t>(query_properties->EventsLost) +
-                            static_cast<std::uint64_t>(query_properties->RealTimeBuffersLost);
+    const auto loss_count = static_cast<std::uint64_t>(query_properties->EventsLost);
     events_lost_.store(loss_count, std::memory_order_relaxed);
     return loss_count;
 }
@@ -202,18 +212,16 @@ void WINAPI EtwMonitor::EventRecordCallback(EVENT_RECORD* record) {
 }
 
 void EtwMonitor::Consume(TRACEHANDLE trace_handle) {
+    current_consumer_ = this;
     const ULONG result = session_api_.ProcessTrace(&trace_handle, 1, nullptr, nullptr);
     const bool stopped_unexpectedly = running_.exchange(false, std::memory_order_acq_rel);
     if (stopped_unexpectedly) {
         if (result != ERROR_SUCCESS) {
             SetLastErrorIfEmpty(result);
         }
-        bool expected = false;
-        if (cleanup_started_.compare_exchange_strong(expected, true,
-                                                     std::memory_order_acq_rel)) {
-            CloseOwnedResources();
-        }
+        RequestStop();
     }
+    current_consumer_ = nullptr;
 }
 
 void EtwMonitor::HandleEvent(const EVENT_RECORD& record) {
@@ -229,6 +237,15 @@ void EtwMonitor::HandleEvent(const EVENT_RECORD& record) {
         decoded->destination_port);
     aggregator_.Add({{process.id, decoded->transport, application_protocol}, process.name,
                      decoded->direction, decoded->bytes});
+}
+
+void EtwMonitor::RequestStop() {
+    bool expected = false;
+    if ((session_handle_ != 0 || trace_handle_ != INVALID_PROCESSTRACE_HANDLE) &&
+        cleanup_started_.compare_exchange_strong(expected, true,
+                                                 std::memory_order_acq_rel)) {
+        CloseOwnedResources();
+    }
 }
 
 void EtwMonitor::CloseOwnedResources() {
@@ -249,18 +266,8 @@ void EtwMonitor::CloseOwnedResources() {
     }
 }
 
-void EtwMonitor::StopOwnedSessionLocked() {
-    bool expected = false;
-    if ((session_handle_ != 0 || trace_handle_ != INVALID_PROCESSTRACE_HANDLE) &&
-        cleanup_started_.compare_exchange_strong(expected, true,
-                                                 std::memory_order_acq_rel)) {
-        CloseOwnedResources();
-    }
-
+void EtwMonitor::FinalizeStoppedSession() {
     if (consumer_.joinable()) {
-        if (consumer_.get_id() == std::this_thread::get_id()) {
-            return;
-        }
         consumer_.join();
     }
 

@@ -38,6 +38,7 @@ public:
     EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_cache);
     EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_cache,
                IEtwSessionApi& session_api);
+    // Lifetime precondition: destruction must occur outside the ETW consumer/callback thread.
     ~EtwMonitor();
 
     EtwMonitor(const EtwMonitor&) = delete;
@@ -53,11 +54,13 @@ public:
 
 private:
     static void WINAPI EventRecordCallback(EVENT_RECORD* record);
+    static thread_local EtwMonitor* current_consumer_;
 
     void Consume(TRACEHANDLE trace_handle);
     void HandleEvent(const EVENT_RECORD& record);
+    void RequestStop();
     void CloseOwnedResources();
-    void StopOwnedSessionLocked();
+    void FinalizeStoppedSession();
     void SetLastErrorIfEmpty(ULONG error) const noexcept;
     EVENT_TRACE_PROPERTIES* properties() noexcept;
 
@@ -66,7 +69,7 @@ private:
     IEtwSessionApi& session_api_;
     EtwDecoder decoder_;
 
-    mutable std::mutex lifecycle_mutex_;
+    mutable std::mutex transition_mutex_;
     mutable std::mutex api_mutex_;
     std::wstring session_name_;
     std::vector<std::byte> properties_buffer_;
