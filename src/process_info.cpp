@@ -90,22 +90,55 @@ ProcessInfoCache::ProcessInfoCache(IProcessInfoApi& process_api) : process_api_(
 
 ProcessInfo ProcessInfoCache::Resolve(std::uint32_t pid,
                                       std::uint64_t fallback_observation_id) {
+    auto cached = cache_.find(pid);
+    if (cached != cache_.end()) {
+        const auto creation_time = process_api_.QueryCreationTime(pid);
+        if (creation_time &&
+            *creation_time == cached->second.info.id.creation_time_100ns) {
+            cached->second.failed_creation_queries = 0;
+            return cached->second.info;
+        }
+        if (!creation_time && ++cached->second.failed_creation_queries < 8) {
+            return cached->second.info;
+        }
+
+        const auto process = process_api_.QueryProcess(pid);
+        if (process) {
+            cached->second = {*process, 0};
+            return *process;
+        }
+        cache_.erase(cached);
+        auto [fallback, inserted] = fallback_cache_.try_emplace(
+            pid, FallbackEntry{FallbackProcess(pid, fallback_observation_id)});
+        if (!inserted) {
+            fallback->second = {FallbackProcess(pid, fallback_observation_id)};
+        }
+        return fallback->second.info;
+    }
+
+    auto fallback = fallback_cache_.find(pid);
+    if (fallback != fallback_cache_.end() &&
+        fallback->second.observations_before_retry != 0) {
+        --fallback->second.observations_before_retry;
+        return fallback->second.info;
+    }
+
     const auto process = process_api_.QueryProcess(pid);
-    if (!process) {
-        return fallback_cache_
-            .try_emplace(pid, FallbackProcess(pid, fallback_observation_id))
-            .first->second;
+    if (process) {
+        fallback_cache_.erase(pid);
+        cache_[pid] = {*process, 0};
+        return *process;
     }
 
-    fallback_cache_.erase(pid);
-    const auto cached = cache_.find(pid);
-    if (cached != cache_.end() &&
-        cached->second.id.creation_time_100ns == process->id.creation_time_100ns) {
-        return cached->second;
+    if (fallback == fallback_cache_.end()) {
+        fallback = fallback_cache_
+                       .try_emplace(pid,
+                                    FallbackEntry{FallbackProcess(pid, fallback_observation_id)})
+                       .first;
+    } else {
+        fallback->second.observations_before_retry = 7;
     }
-
-    cache_[pid] = *process;
-    return *process;
+    return fallback->second.info;
 }
 
 bool ProcessInfoCache::RefreshAlive(ProcessInstanceId id) const {

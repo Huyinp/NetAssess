@@ -271,12 +271,21 @@ EtwDecoder::EtwDecoder(SchemaLoader schema_loader)
     : schema_loader_(schema_loader ? std::move(schema_loader) : LoadEventLayout) {}
 
 std::optional<DecodedNetworkEvent> EtwDecoder::Decode(const EVENT_RECORD& record) {
+    if (!Classify(record)) {
+        return std::nullopt;
+    }
+    const auto header_width_flags = static_cast<std::uint16_t>(
+        record.EventHeader.Flags &
+        (EVENT_HEADER_FLAG_32_BIT_HEADER | EVENT_HEADER_FLAG_64_BIT_HEADER));
+    if (header_width_flags != EVENT_HEADER_FLAG_32_BIT_HEADER &&
+        header_width_flags != EVENT_HEADER_FLAG_64_BIT_HEADER) {
+        return std::nullopt;
+    }
+
     const SchemaKey key{record.EventHeader.ProviderId,
                         record.EventHeader.EventDescriptor.Opcode,
                         record.EventHeader.EventDescriptor.Version,
-                        static_cast<std::uint16_t>(
-                            record.EventHeader.Flags & (EVENT_HEADER_FLAG_32_BIT_HEADER |
-                                                        EVENT_HEADER_FLAG_64_BIT_HEADER))};
+                        header_width_flags};
     auto [layout, inserted] = layouts_.try_emplace(key);
     if (inserted) {
         layout->second = schema_loader_(record);

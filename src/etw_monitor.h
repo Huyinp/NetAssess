@@ -38,6 +38,8 @@ public:
     EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_cache);
     EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_cache,
                IEtwSessionApi& session_api);
+    EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_cache,
+               IEtwSessionApi& session_api, EtwDecoder::SchemaLoader schema_loader);
     // Lifetime precondition: destruction must occur outside the ETW consumer/callback thread.
     ~EtwMonitor();
 
@@ -49,11 +51,12 @@ public:
 
     bool running() const noexcept;
     std::uint64_t events_lost() const;
+    std::uint64_t real_time_buffers_lost() const;
     std::uint64_t parse_failures() const noexcept;
     ULONG last_error() const noexcept;
 
 private:
-    static void WINAPI EventRecordCallback(EVENT_RECORD* record);
+    static void WINAPI EventRecordCallback(EVENT_RECORD* record) noexcept;
     static thread_local EtwMonitor* current_consumer_;
 
     void Consume(TRACEHANDLE trace_handle);
@@ -62,6 +65,8 @@ private:
     void CloseOwnedResources();
     void FinalizeStoppedSession();
     void SetLastErrorIfEmpty(ULONG error) const noexcept;
+    void RefreshLossCounters() const;
+    void StoreLossCounters(const EVENT_TRACE_PROPERTIES& properties) const noexcept;
     EVENT_TRACE_PROPERTIES* properties() noexcept;
 
     TrafficAggregator& aggregator_;
@@ -81,5 +86,6 @@ private:
     std::atomic_bool running_{};
     std::atomic_bool cleanup_started_{};
     mutable std::atomic_uint64_t events_lost_{};
+    mutable std::atomic_uint64_t real_time_buffers_lost_{};
     mutable std::atomic<ULONG> last_error_{};
 };

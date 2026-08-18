@@ -10,11 +10,17 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "NetAssess supports x64 builds only.")
 endif()
 
-if(CMAKE_GENERATOR_PLATFORM)
-    string(TOLOWER "${CMAKE_GENERATOR_PLATFORM}" netassess_generator_platform)
-    if(NOT netassess_generator_platform STREQUAL "x64")
-        message(FATAL_ERROR "NetAssess supports the x64 generator platform only.")
-    endif()
+if(NOT MSVC)
+    message(FATAL_ERROR "NetAssess requires the MSVC compiler.")
+endif()
+
+if(NOT CMAKE_GENERATOR MATCHES "^Visual Studio ")
+    message(FATAL_ERROR "NetAssess requires a Visual Studio generator.")
+endif()
+
+if(NOT CMAKE_GENERATOR_PLATFORM STREQUAL "x64")
+    message(FATAL_ERROR
+        "NetAssess requires an explicit x64 generator platform; configure with -A x64.")
 endif()
 
 add_library(NetAssessCore STATIC src/protocol_classifier.cpp src/traffic_aggregator.cpp src/formatting.cpp

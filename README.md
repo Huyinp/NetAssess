@@ -10,7 +10,7 @@ NetAssess 是一个原生 x64 Windows GUI 程序，使用 ETW 实时统计本机
 
 ## 构建与测试
 
-要求 Visual Studio 2022 Professional、MSVC、Windows SDK 和 CMake。在仓库根目录打开 PowerShell，执行：
+要求 Visual Studio 2022 Professional、MSVC、Windows SDK 和 CMake。项目会拒绝非 MSVC 编译器、非 Visual Studio 生成器，以及未显式指定或不是 `x64` 的生成器平台；因此即使 IDE 默认选择 x64，也必须在配置时传入 `-A x64`。在仓库根目录打开 PowerShell，执行：
 
 ```powershell
 $netAssessCmake = 'D:\Program Files\Microsoft Visual Studio\2022\Professional\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
@@ -45,7 +45,7 @@ Release 可执行文件位于 `build/Release/NetAssess.exe`。这是 Windows 子
 | 下行累计 | 采集开始后 ETW 报告的接收 IP 字节数 |
 | 下行速度 | 当前接收速率 |
 
-状态栏显示当前采集状态、ETW 丢失事件数、解析失败事件数和最近错误。会话启动失败时，窗口仍保持可操作；请根据系统错误码排查后重试，不要停止其他 ETW 会话。
+状态栏分别显示当前采集状态、ETW 事件丢失数、实时缓冲区丢失数、解析失败事件数和最近错误。会话启动失败时，窗口仍保持可操作；请根据系统错误码排查后重试，不要停止其他 ETW 会话。
 
 ## 统计口径
 
@@ -53,7 +53,7 @@ Release 可执行文件位于 `build/Release/NetAssess.exe`。这是 Windows 子
 - 累计值只包含开始采集后收到的 ETW IP 网络事件字节，不是网卡线速字节，也不包含所有链路层开销。
 - 界面约每秒取一次快照。速度是两次快照的字节差除以单调时钟的实际时间差，并非假定间隔永远恰好为 1.000 秒。首次快照、清零后的首次快照、无正时间差或计数回退时，速度显示为 0。
 - 字节数使用 1024 进制格式化为 B/KB/MB/GB/TB，速度显示为 B/s、KB/s、MB/s、GB/s 或 TB/s。
-- 当状态栏的“ETW 丢失”计数非零时，部分事件已无法补回；此时显示的累计值只是实际流量的下界。“解析失败”事件也不会进入统计。
+- “事件丢失”对应 ETW 的 `EventsLost`，“实时缓冲区丢失”对应 `RealTimeBuffersLost`；任一计数非零都表示部分事件可能已无法补回，此时累计值只是实际流量的下界。两个计数分别展示，不相加。“解析失败”只统计目标 TCP/UDP 收发事件的 schema 或 payload 错误，未知 provider 和 connect/disconnect 等非目标 opcode 会被静默忽略。
 - 64 位累计值溢出时会饱和到 `UINT64_MAX`，不会回绕。
 
 ## 端口协议推断
@@ -88,5 +88,7 @@ Release 可执行文件位于 `build/Release/NetAssess.exe`。这是 Windows 子
 ## 已知限制
 
 - 极高事件率或系统资源不足时 ETW 可能丢失事件，程序只能显示计数，不能补回。
+- 为避免对每个网络事件执行完整进程查询，已识别进程只校验创建时间；查询暂时失败或进程不可访问时，每 8 个该 PID 的事件重试一次完整查询。因此恢复可访问状态或不可访问 PID 被复用后，最多可能延迟 8 个该 PID 的事件才更新身份。
+- 如果停止私有 ETW 会话时系统返回非完成型错误，程序会保留该会话的控制所有权并拒绝创建新会话；可再次点击“停止采集”重试，最近错误会保留用于排查。
 - Windows 会限制可并存的系统记录器数量。槽位耗尽时 NetAssess 拒绝采集，不会查找、停止或修改其他 ETW 会话。
 - 首版仅提供实时 GUI，不提供历史恢复、曲线图、文件导出、数据库、远程管理或报文深度解析。

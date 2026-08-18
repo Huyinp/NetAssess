@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iterator>
 #include <system_error>
+#include <utility>
 
 #include <objbase.h>
 
@@ -64,7 +65,14 @@ EtwMonitor::EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_
 
 EtwMonitor::EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_cache,
                        IEtwSessionApi& session_api)
-    : aggregator_(aggregator), process_cache_(process_cache), session_api_(session_api) {}
+    : EtwMonitor(aggregator, process_cache, session_api, {}) {}
+
+EtwMonitor::EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_cache,
+                       IEtwSessionApi& session_api, EtwDecoder::SchemaLoader schema_loader)
+    : aggregator_(aggregator),
+      process_cache_(process_cache),
+      session_api_(session_api),
+      decoder_(std::move(schema_loader)) {}
 
 EtwMonitor::~EtwMonitor() {
     Stop();
@@ -76,10 +84,16 @@ bool EtwMonitor::Start() {
         return true;
     }
 
+    if (session_handle_ != 0) {
+        FinalizeStoppedSession();
+        return false;
+    }
+
     RequestStop();
     FinalizeStoppedSession();
     last_error_.store(ERROR_SUCCESS, std::memory_order_relaxed);
     events_lost_.store(0, std::memory_order_relaxed);
+    real_time_buffers_lost_.store(0, std::memory_order_relaxed);
 
     GUID session_guid{};
     const HRESULT guid_result = CoCreateGuid(&session_guid);
@@ -171,14 +185,24 @@ bool EtwMonitor::running() const noexcept {
 }
 
 std::uint64_t EtwMonitor::events_lost() const {
+    RefreshLossCounters();
+    return events_lost_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t EtwMonitor::real_time_buffers_lost() const {
+    RefreshLossCounters();
+    return real_time_buffers_lost_.load(std::memory_order_relaxed);
+}
+
+void EtwMonitor::RefreshLossCounters() const {
     std::lock_guard transition_lock(transition_mutex_);
     if (session_handle_ == 0 || cleanup_started_.load(std::memory_order_acquire)) {
-        return events_lost_.load(std::memory_order_relaxed);
+        return;
     }
 
     std::lock_guard api_lock(api_mutex_);
     if (cleanup_started_.load(std::memory_order_acquire)) {
-        return events_lost_.load(std::memory_order_relaxed);
+        return;
     }
 
     auto query_buffer = properties_buffer_;
@@ -188,12 +212,10 @@ std::uint64_t EtwMonitor::events_lost() const {
         session_handle_, session_name_.c_str(), query_properties, EVENT_TRACE_CONTROL_QUERY);
     if (result != ERROR_SUCCESS) {
         SetLastErrorIfEmpty(result);
-        return events_lost_.load(std::memory_order_relaxed);
+        return;
     }
 
-    const auto loss_count = static_cast<std::uint64_t>(query_properties->EventsLost);
-    events_lost_.store(loss_count, std::memory_order_relaxed);
-    return loss_count;
+    StoreLossCounters(*query_properties);
 }
 
 std::uint64_t EtwMonitor::parse_failures() const noexcept {
@@ -204,11 +226,21 @@ ULONG EtwMonitor::last_error() const noexcept {
     return last_error_.load(std::memory_order_relaxed);
 }
 
-void WINAPI EtwMonitor::EventRecordCallback(EVENT_RECORD* record) {
+void WINAPI EtwMonitor::EventRecordCallback(EVENT_RECORD* record) noexcept {
     if (record == nullptr || record->UserContext == nullptr) {
         return;
     }
-    static_cast<EtwMonitor*>(record->UserContext)->HandleEvent(*record);
+    auto* monitor = static_cast<EtwMonitor*>(record->UserContext);
+    try {
+        monitor->HandleEvent(*record);
+    } catch (...) {
+        monitor->running_.store(false, std::memory_order_release);
+        monitor->SetLastErrorIfEmpty(ERROR_UNHANDLED_EXCEPTION);
+        try {
+            monitor->RequestStop();
+        } catch (...) {
+        }
+    }
 }
 
 void EtwMonitor::Consume(TRACEHANDLE trace_handle) {
@@ -253,7 +285,10 @@ void EtwMonitor::CloseOwnedResources() {
     if (session_handle_ != 0) {
         const ULONG result = session_api_.ControlTraceW(
             session_handle_, session_name_.c_str(), properties(), EVENT_TRACE_CONTROL_STOP);
-        if (!IsCompletedStopResult(result)) {
+        if (IsCompletedStopResult(result)) {
+            StoreLossCounters(*properties());
+            session_handle_ = 0;
+        } else {
             SetLastErrorIfEmpty(result);
         }
     }
@@ -263,6 +298,7 @@ void EtwMonitor::CloseOwnedResources() {
         if (!IsIgnorableCloseResult(result)) {
             SetLastErrorIfEmpty(result);
         }
+        trace_handle_ = INVALID_PROCESSTRACE_HANDLE;
     }
 }
 
@@ -271,17 +307,25 @@ void EtwMonitor::FinalizeStoppedSession() {
         consumer_.join();
     }
 
-    session_handle_ = 0;
-    trace_handle_ = INVALID_PROCESSTRACE_HANDLE;
-    log_file_ = {};
-    session_name_.clear();
-    properties_buffer_.clear();
+    if (session_handle_ == 0) {
+        log_file_ = {};
+        session_name_.clear();
+        properties_buffer_.clear();
+    }
     cleanup_started_.store(false, std::memory_order_release);
 }
 
 void EtwMonitor::SetLastErrorIfEmpty(ULONG error) const noexcept {
     ULONG expected = ERROR_SUCCESS;
     last_error_.compare_exchange_strong(expected, error, std::memory_order_relaxed);
+}
+
+void EtwMonitor::StoreLossCounters(const EVENT_TRACE_PROPERTIES& properties) const noexcept {
+    events_lost_.store(static_cast<std::uint64_t>(properties.EventsLost),
+                       std::memory_order_relaxed);
+    real_time_buffers_lost_.store(
+        static_cast<std::uint64_t>(properties.RealTimeBuffersLost),
+        std::memory_order_relaxed);
 }
 
 EVENT_TRACE_PROPERTIES* EtwMonitor::properties() noexcept {

@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cwctype>
 #include <iomanip>
 #include <limits>
 #include <sstream>
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 
 namespace {
 
@@ -41,13 +44,10 @@ double CombinedRate(const TrafficSnapshot& snapshot) {
 }
 
 int CompareCaseInsensitive(std::wstring_view left, std::wstring_view right) {
-    const auto result = std::lexicographical_compare_three_way(
-        left.begin(), left.end(), right.begin(), right.end(),
-        [](wchar_t left_character, wchar_t right_character) {
-            return std::compare_three_way{}(std::towlower(left_character),
-                                            std::towlower(right_character));
-        });
-    return result < 0 ? -1 : result > 0 ? 1 : 0;
+    const int result = CompareStringOrdinal(
+        left.data(), static_cast<int>(left.size()), right.data(),
+        static_cast<int>(right.size()), TRUE);
+    return result == CSTR_LESS_THAN ? -1 : result == CSTR_GREATER_THAN ? 1 : 0;
 }
 
 template <typename T>

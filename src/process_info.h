@@ -29,7 +29,17 @@ public:
     bool RefreshAlive(ProcessInstanceId id) const;
 
 private:
+    struct CachedProcess {
+        ProcessInfo info;
+        std::uint8_t failed_creation_queries{};
+    };
+
+    struct FallbackEntry {
+        ProcessInfo info;
+        std::uint8_t observations_before_retry{7};
+    };
+
     IProcessInfoApi& process_api_;
-    std::unordered_map<std::uint32_t, ProcessInfo> cache_;
-    std::unordered_map<std::uint32_t, ProcessInfo> fallback_cache_;
+    std::unordered_map<std::uint32_t, CachedProcess> cache_;
+    std::unordered_map<std::uint32_t, FallbackEntry> fallback_cache_;
 };

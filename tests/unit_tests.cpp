@@ -18,6 +18,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -100,6 +101,7 @@ public:
         open_mode = log_file->ProcessTraceMode;
         opened_context = log_file->Context;
         has_event_callback = log_file->EventRecordCallback != nullptr;
+        event_callback = log_file->EventRecordCallback;
         calls.emplace_back("open");
         if (trace_handle_to_return == INVALID_PROCESSTRACE_HANDLE) {
             SetLastError(open_error);
@@ -179,6 +181,11 @@ public:
         controlled_name = session_name;
         controlled_code = control_code;
         calls.emplace_back("control-stop");
+        properties->EventsLost = stop_events_lost;
+        properties->RealTimeBuffersLost = stop_real_time_buffers_lost;
+        if (control_stop_index < control_stop_statuses.size()) {
+            return control_stop_statuses[control_stop_index++];
+        }
         return control_status;
     }
 
@@ -243,6 +250,11 @@ public:
         process_trace_action = std::move(action);
     }
 
+    void InvokeEventCallback(EVENT_RECORD& record) {
+        record.UserContext = opened_context;
+        event_callback(&record);
+    }
+
     void HoldProcessTraceAction(bool hold) {
         std::lock_guard lock(mutex);
         hold_worker_action = hold;
@@ -257,6 +269,10 @@ public:
     TRACEHANDLE trace_handle_to_return{202};
     ULONG query_events_lost{};
     ULONG query_real_time_buffers_lost{};
+    ULONG stop_events_lost{};
+    ULONG stop_real_time_buffers_lost{};
+    std::vector<ULONG> control_stop_statuses;
+    std::size_t control_stop_index{};
     bool block_process_trace{true};
     bool block_query{};
 
@@ -278,6 +294,7 @@ public:
     ULONG open_mode{};
     void* opened_context{};
     bool has_event_callback{};
+    PEVENT_RECORD_CALLBACK event_callback{};
     TRACEHANDLE closed_trace_handle{};
     TRACEHANDLE controlled_session_handle{};
     TRACEHANDLE queried_session_handle{};
@@ -301,16 +318,28 @@ private:
 class FakeProcessInfoApi final : public IProcessInfoApi {
 public:
     std::optional<ProcessInfo> QueryProcess(std::uint32_t) override {
-        return query_results.at(query_index++);
+        ++query_process_calls;
+        if (query_index < query_results.size()) {
+            return query_results[query_index++];
+        }
+        return std::nullopt;
     }
 
     std::optional<std::uint64_t> QueryCreationTime(std::uint32_t) override {
+        ++query_creation_time_calls;
+        if (creation_time_index < creation_time_results.size()) {
+            return creation_time_results[creation_time_index++];
+        }
         return creation_time;
     }
 
     std::vector<std::optional<ProcessInfo>> query_results;
     std::size_t query_index{};
     std::optional<std::uint64_t> creation_time;
+    std::vector<std::optional<std::uint64_t>> creation_time_results;
+    std::size_t creation_time_index{};
+    int query_process_calls{};
+    int query_creation_time_calls{};
 };
 
 int RunEtwMonitorStopInterleavingChild() {
@@ -520,6 +549,74 @@ void TestEtwDecoderCachesInvalidLayoutsAndCountsEveryFailedEvent() {
     CHECK_EQ(decoder.parse_failures(), 2ULL);
 }
 
+void TestEtwDecoderIgnoresNonNetworkAndNonDataEvents() {
+    int load_count = 0;
+    EtwDecoder decoder([&](const EVENT_RECORD&) -> std::optional<EventLayout> {
+        ++load_count;
+        return std::nullopt;
+    });
+    EVENT_RECORD record{};
+    record.EventHeader.ProviderId = GUID_NULL;
+    record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_SEND;
+    record.EventHeader.Flags = EVENT_HEADER_FLAG_64_BIT_HEADER;
+
+    CHECK_EQ(decoder.Decode(record).has_value(), false);
+
+    record.EventHeader.ProviderId =
+        GUID{0x9a280ac0, 0xc8e0, 0x11d1, {0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2}};
+    record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_CONNECT;
+    CHECK_EQ(decoder.Decode(record).has_value(), false);
+
+    record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_SEND;
+    record.EventHeader.Flags = 0;
+    CHECK_EQ(decoder.Decode(record).has_value(), false);
+
+    CHECK_EQ(load_count, 0);
+    CHECK_EQ(decoder.cached_layout_count(), 0U);
+    CHECK_EQ(decoder.parse_failures(), 0ULL);
+}
+
+void TestSyntheticRecordFlowsThroughDecodeResolveClassifyAndAggregate() {
+    const EventLayout layout{{0, 4}, {4, 4}, {8, 2}, {10, 2},
+                             TrafficDirection::Send, TransportProtocol::Tcp};
+    const std::array payload{
+        std::byte{0xD2}, std::byte{0x04}, std::byte{0x00}, std::byte{0x00},
+        std::byte{0x00}, std::byte{0x08}, std::byte{0x00}, std::byte{0x00},
+        std::byte{0xC3}, std::byte{0x50}, std::byte{0x01}, std::byte{0xBB},
+    };
+    EtwDecoder decoder([&](const EVENT_RECORD&) -> std::optional<EventLayout> {
+        return layout;
+    });
+    EVENT_RECORD record{};
+    record.EventHeader.ProviderId =
+        GUID{0x9a280ac0, 0xc8e0, 0x11d1, {0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2}};
+    record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_SEND;
+    record.EventHeader.Flags = EVENT_HEADER_FLAG_64_BIT_HEADER;
+    record.UserData = const_cast<std::byte*>(payload.data());
+    record.UserDataLength = static_cast<USHORT>(payload.size());
+
+    FakeProcessInfoApi process_api;
+    process_api.query_results = {ProcessInfo{{1234, 55}, L"browser.exe", true}};
+    ProcessInfoCache process_cache(process_api);
+    TrafficAggregator aggregator;
+    const auto decoded = decoder.Decode(record);
+    CHECK_EQ(decoded.has_value(), true);
+    if (decoded) {
+        const auto process = process_cache.Resolve(decoded->pid, 1);
+        const auto application = InferApplicationProtocol(
+            decoded->transport, decoded->direction, decoded->source_port,
+            decoded->destination_port);
+        aggregator.Add({{process.id, decoded->transport, application}, process.name,
+                        decoded->direction, decoded->bytes});
+    }
+
+    const auto snapshots = aggregator.Snapshot(std::chrono::steady_clock::time_point{});
+    const TrafficKey expected{{1234, 55}, TransportProtocol::Tcp,
+                              ApplicationProtocol::HttpsTls};
+    CHECK_EQ(snapshots.size(), 1U);
+    CHECK_EQ(FindSnapshot(snapshots, expected).sent_bytes, 2048ULL);
+}
+
 void TestTrafficRatesClearAndSaturation() {
     TrafficAggregator aggregator;
     const auto t0 = std::chrono::steady_clock::time_point{};
@@ -548,6 +645,13 @@ void TestTrafficRatesClearAndSaturation() {
     overflow_aggregator.Add({key, L"first.exe", TrafficDirection::Send, 2});
     const auto overflow_snapshots = overflow_aggregator.Snapshot(t0);
     CHECK_EQ(FindSnapshot(overflow_snapshots, key).sent_bytes,
+             std::numeric_limits<std::uint64_t>::max());
+
+    TrafficAggregator receive_overflow_aggregator;
+    receive_overflow_aggregator.Add({key, L"first.exe", TrafficDirection::Receive,
+                                     std::numeric_limits<std::uint64_t>::max() - 1});
+    receive_overflow_aggregator.Add({key, L"first.exe", TrafficDirection::Receive, 2});
+    CHECK_EQ(FindSnapshot(receive_overflow_aggregator.Snapshot(t0), key).received_bytes,
              std::numeric_limits<std::uint64_t>::max());
 }
 
@@ -667,6 +771,16 @@ void TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically() {
     CHECK_EQ(rows[0].traffic.key.process.pid, ended.process.pid);
     CHECK_EQ(rows[1].traffic.key.process.pid, first_running.process.pid);
     CHECK_EQ(rows[2].traffic.key.process.pid, second_running.process.pid);
+
+    const TrafficKey lower_umlaut{{41, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
+    const TrafficKey upper_umlaut{{40, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
+    rows = {
+        {MakeSnapshot(lower_umlaut, L"\u00e4.exe", 0.0, 0.0), true},
+        {MakeSnapshot(upper_umlaut, L"\u00c4.exe", 0.0, 0.0), true},
+    };
+    SortTrafficRows(rows, SortColumn::ProcessName, true);
+    CHECK_EQ(rows[0].traffic.key.process.pid, upper_umlaut.process.pid);
+    CHECK_EQ(rows[1].traffic.key.process.pid, lower_umlaut.process.pid);
 }
 
 void TestVisibleRowsFilterWithoutMutatingSnapshotAndAttachLiveness() {
@@ -767,14 +881,72 @@ void TestProcessInfoFallbackDoesNotMaskRealIdentityOrPidReuse() {
     ProcessInfoCache cache(api);
 
     const auto fallback = cache.Resolve(pid, 100);
-    const auto first_real_process = cache.Resolve(pid, 101);
-    const auto reused_pid_process = cache.Resolve(pid, 102);
+    for (std::uint64_t observation = 101; observation < 108; ++observation) {
+        CHECK_EQ(cache.Resolve(pid, observation).id.creation_time_100ns, 100ULL);
+    }
+    const auto first_real_process = cache.Resolve(pid, 108);
+    api.creation_time = 600;
+    const auto reused_pid_process = cache.Resolve(pid, 109);
 
     CHECK_EQ(fallback.id.creation_time_100ns, 100ULL);
     CHECK_EQ(first_real_process.id.creation_time_100ns, 500ULL);
     CHECK_EQ(first_real_process.name, L"first.exe");
     CHECK_EQ(reused_pid_process.id.creation_time_100ns, 600ULL);
     CHECK_EQ(reused_pid_process.name, L"second.exe");
+}
+
+void TestProcessInfoCacheUsesCreationTimeOnRealCacheHits() {
+    constexpr std::uint32_t pid = 4321;
+    FakeProcessInfoApi api;
+    api.query_results = {ProcessInfo{{pid, 500}, L"first.exe", true}};
+    api.creation_time = 500;
+    ProcessInfoCache cache(api);
+
+    for (std::uint64_t observation = 1; observation <= 5; ++observation) {
+        CHECK_EQ(cache.Resolve(pid, observation).name, L"first.exe");
+    }
+
+    CHECK_EQ(api.query_process_calls, 1);
+    CHECK_EQ(api.query_creation_time_calls, 4);
+}
+
+void TestProcessInfoFallbackDetectsAccessiblePidReuseWithinEightEvents() {
+    constexpr std::uint32_t pid = 4322;
+    FakeProcessInfoApi api;
+    api.query_results = {
+        std::nullopt,
+        ProcessInfo{{pid, 700}, L"recovered.exe", true},
+    };
+    ProcessInfoCache cache(api);
+
+    CHECK_EQ(cache.Resolve(pid, 1).alive, false);
+    for (std::uint64_t observation = 2; observation < 9; ++observation) {
+        CHECK_EQ(cache.Resolve(pid, observation).alive, false);
+    }
+    CHECK_EQ(api.query_process_calls, 1);
+    const auto reused = cache.Resolve(pid, 9);
+    CHECK_EQ(reused.name, L"recovered.exe");
+    CHECK_EQ(reused.id.creation_time_100ns, 700ULL);
+    CHECK_EQ(api.query_process_calls, 2);
+}
+
+void TestProcessInfoCreationQueryFailureEventuallyDetectsPidReuse() {
+    constexpr std::uint32_t pid = 4323;
+    FakeProcessInfoApi api;
+    api.query_results = {
+        ProcessInfo{{pid, 800}, L"old.exe", true},
+        ProcessInfo{{pid, 900}, L"new.exe", true},
+    };
+    api.creation_time_results.assign(8, std::nullopt);
+    ProcessInfoCache cache(api);
+
+    CHECK_EQ(cache.Resolve(pid, 1).name, L"old.exe");
+    for (std::uint64_t observation = 2; observation < 9; ++observation) {
+        CHECK_EQ(cache.Resolve(pid, observation).name, L"old.exe");
+    }
+    CHECK_EQ(cache.Resolve(pid, 9).name, L"new.exe");
+    CHECK_EQ(api.query_process_calls, 2);
+    CHECK_EQ(api.query_creation_time_calls, 8);
 }
 
 void TestEtwMonitorStartsOneConfiguredConsumer() {
@@ -952,6 +1124,83 @@ void TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop() {
     CHECK_EQ(api.close_trace_calls, 1);
 }
 
+void TestEtwMonitorExposesRealTimeBufferLossSeparately() {
+    TrafficAggregator aggregator;
+    ProcessInfoCache process_cache;
+    FakeEtwSessionApi api;
+    api.query_real_time_buffers_lost = 7;
+    EtwMonitor monitor(aggregator, process_cache, api);
+
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+    CHECK_EQ(monitor.events_lost(), 0ULL);
+    CHECK_EQ(monitor.real_time_buffers_lost(), 7ULL);
+    monitor.Stop();
+}
+
+void TestEtwMonitorKeepsFinalLossCountersFromSuccessfulStop() {
+    TrafficAggregator aggregator;
+    ProcessInfoCache process_cache;
+    FakeEtwSessionApi api;
+    api.stop_events_lost = 11;
+    api.stop_real_time_buffers_lost = 13;
+    EtwMonitor monitor(aggregator, process_cache, api);
+
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+    monitor.Stop();
+    CHECK_EQ(monitor.events_lost(), 11ULL);
+    CHECK_EQ(monitor.real_time_buffers_lost(), 13ULL);
+}
+
+void TestEtwMonitorRetainsSessionOwnershipAfterFailedStop() {
+    TrafficAggregator aggregator;
+    ProcessInfoCache process_cache;
+    FakeEtwSessionApi api;
+    api.control_stop_statuses = {ERROR_ACCESS_DENIED, ERROR_SUCCESS};
+    EtwMonitor monitor(aggregator, process_cache, api);
+
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+    monitor.Stop();
+    CHECK_EQ(api.control_stop_calls, 1);
+    CHECK_EQ(api.close_trace_calls, 1);
+    CHECK_EQ(monitor.Start(), false);
+    CHECK_EQ(api.start_trace_calls, 1);
+
+    monitor.Stop();
+    CHECK_EQ(api.control_stop_calls, 2);
+    CHECK_EQ(api.start_trace_calls, 1);
+}
+
+void TestEtwMonitorCallbackContainsExceptionsAndStopsSafely() {
+    TrafficAggregator aggregator;
+    ProcessInfoCache process_cache;
+    FakeEtwSessionApi api;
+    EtwMonitor monitor(
+        aggregator, process_cache, api,
+        [](const EVENT_RECORD&) -> std::optional<EventLayout> {
+            throw std::runtime_error("schema failure");
+        });
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+
+    std::byte payload{};
+    EVENT_RECORD record{};
+    record.EventHeader.ProviderId =
+        GUID{0x9a280ac0, 0xc8e0, 0x11d1, {0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2}};
+    record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_SEND;
+    record.EventHeader.Flags = EVENT_HEADER_FLAG_64_BIT_HEADER;
+    record.UserData = &payload;
+    record.UserDataLength = 1;
+    api.InvokeEventCallback(record);
+
+    CHECK_EQ(api.WaitForClose(), true);
+    CHECK_EQ(monitor.running(), false);
+    CHECK_EQ(monitor.last_error(), static_cast<ULONG>(ERROR_UNHANDLED_EXCEPTION));
+    monitor.Stop();
+}
+
 void TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart() {
     TrafficAggregator aggregator;
     ProcessInfoCache process_cache;
@@ -1021,6 +1270,8 @@ int main(int argc, char** argv) {
     TestEtwPayloadDecodeIsBoundedAndUsesNetworkOrderPorts();
     TestEtwDecoderCachesLayoutsBySchemaKey();
     TestEtwDecoderCachesInvalidLayoutsAndCountsEveryFailedEvent();
+    TestEtwDecoderIgnoresNonNetworkAndNonDataEvents();
+    TestSyntheticRecordFlowsThroughDecodeResolveClassifyAndAggregate();
     TestTrafficRatesClearAndSaturation();
     TestTrafficRatesIgnoreNonpositiveSnapshotTimes();
     TestTrafficAggregationKeepsApplicationProtocolsSeparate();
@@ -1031,6 +1282,9 @@ int main(int argc, char** argv) {
     TestVisibleRowsUsesInvariantUnicodeCaseInsensitiveFilter();
     TestProcessInfoResolvesLiveAndInaccessibleProcesses();
     TestProcessInfoFallbackDoesNotMaskRealIdentityOrPidReuse();
+    TestProcessInfoCacheUsesCreationTimeOnRealCacheHits();
+    TestProcessInfoFallbackDetectsAccessiblePidReuseWithinEightEvents();
+    TestProcessInfoCreationQueryFailureEventuallyDetectsPidReuse();
     TestEtwMonitorStartsOneConfiguredConsumer();
     TestEtwMonitorStopsOnlyOwnedResourcesAndStopIsIdempotent();
     TestEtwMonitorExposesStartTraceFailureWithoutOpeningConsumer();
@@ -1038,6 +1292,10 @@ int main(int argc, char** argv) {
     TestEtwMonitorCleansOwnedResourcesWhenConsumerFails();
     TestEtwMonitorDoesNotReportSuccessfulPendingStopCodesAsErrors();
     TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop();
+    TestEtwMonitorExposesRealTimeBufferLossSeparately();
+    TestEtwMonitorKeepsFinalLossCountersFromSuccessfulStop();
+    TestEtwMonitorRetainsSessionOwnershipAfterFailedStop();
+    TestEtwMonitorCallbackContainsExceptionsAndStopsSafely();
     TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart();
     TestEtwMonitorExternalJoinDoesNotBlockConsumerThreadStop();
 
