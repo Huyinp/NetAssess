@@ -1,3 +1,4 @@
+#include "formatting.h"
 #include "protocol_classifier.h"
 #include "traffic_aggregator.h"
 
@@ -26,6 +27,10 @@ void PrintValue(std::ostream& stream, std::wstring_view value) {
     for (const wchar_t character : value) {
         stream << (character < 128 ? static_cast<char>(character) : '?');
     }
+}
+
+void PrintValue(std::ostream& stream, const std::wstring& value) {
+    PrintValue(stream, std::wstring_view{value});
 }
 
 void PrintValue(std::ostream& stream, const wchar_t* value) {
@@ -159,6 +164,65 @@ void TestTrafficAggregationKeepsApplicationProtocolsSeparate() {
     CHECK_EQ(FindSnapshot(snapshots, http).received_bytes, 200ULL);
 }
 
+TrafficSnapshot MakeSnapshot(TrafficKey key, std::wstring process_name,
+                             double sent_bytes_per_second,
+                             double received_bytes_per_second) {
+    TrafficSnapshot snapshot;
+    snapshot.key = key;
+    snapshot.process_name = std::move(process_name);
+    snapshot.sent_bytes_per_second = sent_bytes_per_second;
+    snapshot.received_bytes_per_second = received_bytes_per_second;
+    return snapshot;
+}
+
+void TestTrafficFormatting() {
+    CHECK_EQ(FormatBytes(0), L"0 B");
+    CHECK_EQ(FormatBytes(1024), L"1 KB");
+    CHECK_EQ(FormatBytes(1536), L"1.5 KB");
+    CHECK_EQ(FormatBytes(1024ULL * 1024 * 1024), L"1 GB");
+    CHECK_EQ(FormatRate(2048.0), L"2 KB/s");
+    CHECK_EQ(FormatRate(-1.0), L"0 B/s");
+    CHECK_EQ(FormatRate(std::numeric_limits<double>::infinity()), L"0 B/s");
+    CHECK_EQ(FormatRate(std::numeric_limits<double>::quiet_NaN()), L"0 B/s");
+    CHECK_EQ(ProcessStatusText(true), L"运行中");
+    CHECK_EQ(ProcessStatusText(false), L"已结束");
+}
+
+void TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically() {
+    const TrafficKey slow{{300, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
+    const TrafficKey fast{{200, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
+    const TrafficKey medium{{100, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
+    std::vector<TrafficSnapshot> rows{
+        MakeSnapshot(slow, L"slow.exe", 10.0, 0.0),
+        MakeSnapshot(fast, L"fast.exe", 30.0, 0.0),
+        MakeSnapshot(medium, L"medium.exe", 20.0, 0.0),
+    };
+
+    SortTrafficRows(rows, SortColumn::CombinedSpeed, false);
+    CHECK_EQ(rows[0].key.process.pid, fast.process.pid);
+    CHECK_EQ(rows[1].key.process.pid, medium.process.pid);
+    CHECK_EQ(rows[2].key.process.pid, slow.process.pid);
+
+    SortTrafficRows(rows, SortColumn::Pid, true);
+    CHECK_EQ(rows[0].key.process.pid, medium.process.pid);
+    CHECK_EQ(rows[1].key.process.pid, fast.process.pid);
+    CHECK_EQ(rows[2].key.process.pid, slow.process.pid);
+
+    const TrafficKey first_alpha{{20, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
+    const TrafficKey second_alpha{{30, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
+    const TrafficKey bravo{{10, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
+    rows = {
+        MakeSnapshot(second_alpha, L"alpha.exe", 0.0, 0.0),
+        MakeSnapshot(bravo, L"bravo.exe", 0.0, 0.0),
+        MakeSnapshot(first_alpha, L"Alpha.exe", 0.0, 0.0),
+    };
+
+    SortTrafficRows(rows, SortColumn::ProcessName, true);
+    CHECK_EQ(rows[0].key.process.pid, first_alpha.process.pid);
+    CHECK_EQ(rows[1].key.process.pid, second_alpha.process.pid);
+    CHECK_EQ(rows[2].key.process.pid, bravo.process.pid);
+}
+
 }  // namespace
 
 int main() {
@@ -194,6 +258,8 @@ int main() {
     TestTrafficRatesClearAndSaturation();
     TestTrafficRatesIgnoreNonpositiveSnapshotTimes();
     TestTrafficAggregationKeepsApplicationProtocolsSeparate();
+    TestTrafficFormatting();
+    TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically();
 
     return failures == 0 ? 0 : 1;
 }
