@@ -26,7 +26,7 @@ void PrintValue(std::ostream& stream, std::wstring_view value) {
             PrintValue(std::cerr, actual_value);                                     \
             std::cerr << ", expected=";                                             \
             PrintValue(std::cerr, expected_value);                                   \
-            std::cerr << '\\n';                                                      \
+            std::cerr << std::endl;                                                  \
             ++failures;                                                               \
         }                                                                            \
     } while (false)
@@ -52,9 +52,15 @@ int main() {
     CHECK_EQ(InferApplicationProtocol(TransportProtocol::Tcp,
                                       TrafficDirection::Receive, 22, 443),
              ApplicationProtocol::Ssh);
+    CHECK_EQ(InferApplicationProtocol(TransportProtocol::Tcp,
+                                      TrafficDirection::Send, 22, 49152),
+             ApplicationProtocol::Ssh);
+    CHECK_EQ(InferApplicationProtocol(TransportProtocol::Tcp,
+                                      TrafficDirection::Receive, 49152, 443),
+             ApplicationProtocol::HttpsTls);
     CHECK_EQ(ApplicationProtocolName(ApplicationProtocol::HttpsTls),
-             L"HTTPS/TLS锛堢鍙ｆ帹鏂級");
-    CHECK_EQ(ApplicationProtocolName(ApplicationProtocol::Other), L"鍏朵粬");
+             L"HTTPS/TLS（端口推断）");
+    CHECK_EQ(ApplicationProtocolName(ApplicationProtocol::Other), L"其他");
 
     return failures == 0 ? 0 : 1;
 }

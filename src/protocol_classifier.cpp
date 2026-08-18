@@ -91,48 +91,48 @@ ApplicationProtocol InferApplicationProtocol(TransportProtocol transport_protoco
 std::wstring_view ApplicationProtocolName(ApplicationProtocol protocol) {
     switch (protocol) {
     case ApplicationProtocol::Ftp:
-        return L"FTP锛堢鍙ｆ帹鏂級";
+        return L"FTP（端口推断）";
     case ApplicationProtocol::Ssh:
-        return L"SSH锛堢鍙ｆ帹鏂級";
+        return L"SSH（端口推断）";
     case ApplicationProtocol::Smtp:
-        return L"SMTP锛堢鍙ｆ帹鏂級";
+        return L"SMTP（端口推断）";
     case ApplicationProtocol::Dns:
-        return L"DNS锛堢鍙ｆ帹鏂級";
+        return L"DNS（端口推断）";
     case ApplicationProtocol::Dhcp:
-        return L"DHCP锛堢鍙ｆ帹鏂級";
+        return L"DHCP（端口推断）";
     case ApplicationProtocol::Http:
-        return L"HTTP锛堢鍙ｆ帹鏂級";
+        return L"HTTP（端口推断）";
     case ApplicationProtocol::Pop3:
-        return L"POP3锛堢鍙ｆ帹鏂級";
+        return L"POP3（端口推断）";
     case ApplicationProtocol::Ntp:
-        return L"NTP锛堢鍙ｆ帹鏂級";
+        return L"NTP（端口推断）";
     case ApplicationProtocol::Imap:
-        return L"IMAP锛堢鍙ｆ帹鏂級";
+        return L"IMAP（端口推断）";
     case ApplicationProtocol::Ldap:
-        return L"LDAP锛堢鍙ｆ帹鏂級";
+        return L"LDAP（端口推断）";
     case ApplicationProtocol::HttpsTls:
-        return L"HTTPS/TLS锛堢鍙ｆ帹鏂級";
+        return L"HTTPS/TLS（端口推断）";
     case ApplicationProtocol::Quic:
-        return L"QUIC锛堢鍙ｆ帹鏂級";
+        return L"QUIC（端口推断）";
     case ApplicationProtocol::Smb:
-        return L"SMB锛堢鍙ｆ帹鏂級";
+        return L"SMB（端口推断）";
     case ApplicationProtocol::IpsecIke:
-        return L"IPsec/IKE锛堢鍙ｆ帹鏂級";
+        return L"IPsec/IKE（端口推断）";
     case ApplicationProtocol::SqlServer:
-        return L"SQL Server锛堢鍙ｆ帹鏂級";
+        return L"SQL Server（端口推断）";
     case ApplicationProtocol::MySql:
-        return L"MySQL锛堢鍙ｆ帹鏂級";
+        return L"MySQL（端口推断）";
     case ApplicationProtocol::Rdp:
-        return L"RDP锛堢鍙ｆ帹鏂級";
+        return L"RDP（端口推断）";
     case ApplicationProtocol::PostgreSql:
-        return L"PostgreSQL锛堢鍙ｆ帹鏂級";
+        return L"PostgreSQL（端口推断）";
     case ApplicationProtocol::Redis:
-        return L"Redis锛堢鍙ｆ帹鏂級";
+        return L"Redis（端口推断）";
     case ApplicationProtocol::MongoDb:
-        return L"MongoDB锛堢鍙ｆ帹鏂級";
+        return L"MongoDB（端口推断）";
     case ApplicationProtocol::Other:
-        return L"鍏朵粬";
+        return L"其他";
     }
 
-    return L"鍏朵粬";
+    return L"其他";
 }
