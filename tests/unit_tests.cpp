@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -295,6 +296,21 @@ private:
     bool allow_worker_action{};
     bool worker_action_finished{};
     bool worker_action_threw{};
+};
+
+class FakeProcessInfoApi final : public IProcessInfoApi {
+public:
+    std::optional<ProcessInfo> QueryProcess(std::uint32_t) override {
+        return query_results.at(query_index++);
+    }
+
+    std::optional<std::uint64_t> QueryCreationTime(std::uint32_t) override {
+        return creation_time;
+    }
+
+    std::vector<std::optional<ProcessInfo>> query_results;
+    std::size_t query_index{};
+    std::optional<std::uint64_t> creation_time;
 };
 
 int RunEtwMonitorStopInterleavingChild() {
@@ -735,6 +751,30 @@ void TestProcessInfoResolvesLiveAndInaccessibleProcesses() {
     CHECK_EQ(inaccessible_process.id.creation_time_100ns, 42ULL);
     CHECK_EQ(inaccessible_process.alive, false);
     CHECK_EQ(cache.RefreshAlive(inaccessible_process.id), false);
+
+    const auto same_inaccessible_process = cache.Resolve(inaccessible_pid, 84);
+    CHECK_EQ(same_inaccessible_process.id.creation_time_100ns, 42ULL);
+}
+
+void TestProcessInfoFallbackDoesNotMaskRealIdentityOrPidReuse() {
+    constexpr std::uint32_t pid = 1234;
+    FakeProcessInfoApi api;
+    api.query_results = {
+        std::nullopt,
+        ProcessInfo{{pid, 500}, L"first.exe", true},
+        ProcessInfo{{pid, 600}, L"second.exe", true},
+    };
+    ProcessInfoCache cache(api);
+
+    const auto fallback = cache.Resolve(pid, 100);
+    const auto first_real_process = cache.Resolve(pid, 101);
+    const auto reused_pid_process = cache.Resolve(pid, 102);
+
+    CHECK_EQ(fallback.id.creation_time_100ns, 100ULL);
+    CHECK_EQ(first_real_process.id.creation_time_100ns, 500ULL);
+    CHECK_EQ(first_real_process.name, L"first.exe");
+    CHECK_EQ(reused_pid_process.id.creation_time_100ns, 600ULL);
+    CHECK_EQ(reused_pid_process.name, L"second.exe");
 }
 
 void TestEtwMonitorStartsOneConfiguredConsumer() {
@@ -990,6 +1030,7 @@ int main(int argc, char** argv) {
     TestVisibleRowsDefaultOrderUsesCombinedSpeedDescending();
     TestVisibleRowsUsesInvariantUnicodeCaseInsensitiveFilter();
     TestProcessInfoResolvesLiveAndInaccessibleProcesses();
+    TestProcessInfoFallbackDoesNotMaskRealIdentityOrPidReuse();
     TestEtwMonitorStartsOneConfiguredConsumer();
     TestEtwMonitorStopsOnlyOwnedResourcesAndStopIsIdempotent();
     TestEtwMonitorExposesStartTraceFailureWithoutOpeningConsumer();
