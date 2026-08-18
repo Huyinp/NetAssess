@@ -10,6 +10,13 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "NetAssess supports x64 builds only.")
 endif()
 
+if(CMAKE_GENERATOR_PLATFORM)
+    string(TOLOWER "${CMAKE_GENERATOR_PLATFORM}" netassess_generator_platform)
+    if(NOT netassess_generator_platform STREQUAL "x64")
+        message(FATAL_ERROR "NetAssess supports the x64 generator platform only.")
+    endif()
+endif()
+
 add_library(NetAssessCore STATIC src/protocol_classifier.cpp)
 target_include_directories(NetAssessCore PUBLIC src)
 target_compile_definitions(NetAssessCore PUBLIC _WIN32_WINNT=0x0A00 UNICODE)
