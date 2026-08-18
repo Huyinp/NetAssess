@@ -1,6 +1,7 @@
 #include "etw_decoder.h"
 #include "etw_monitor.h"
 #include "formatting.h"
+#include "main_window.h"
 #include "process_info.h"
 #include "protocol_classifier.h"
 #include "traffic_aggregator.h"
@@ -652,6 +653,53 @@ void TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically() {
     CHECK_EQ(rows[2].traffic.key.process.pid, second_running.process.pid);
 }
 
+void TestVisibleRowsFilterWithoutMutatingSnapshotAndAttachLiveness() {
+    const TrafficKey fast_alpha{{101, 11}, TransportProtocol::Tcp,
+                                ApplicationProtocol::HttpsTls};
+    const TrafficKey slow_alpha{{102, 22}, TransportProtocol::Udp,
+                                ApplicationProtocol::Dns};
+    const TrafficKey beta{{103, 33}, TransportProtocol::Tcp,
+                          ApplicationProtocol::Http};
+    const std::vector<TrafficSnapshot> snapshots{
+        MakeSnapshot(slow_alpha, L"AlphaWorker.exe", 2.0, 3.0),
+        MakeSnapshot(beta, L"beta.exe", 100.0, 100.0),
+        MakeSnapshot(fast_alpha, L"ALPHA.exe", 20.0, 30.0),
+    };
+
+    const auto rows = BuildVisibleRows(
+        snapshots, L"alpha", SortColumn::CombinedSpeed, false,
+        [](ProcessInstanceId process) { return process.pid == 102; });
+
+    CHECK_EQ(rows.size(), 2U);
+    CHECK_EQ(rows[0].traffic.key.process.pid, fast_alpha.process.pid);
+    CHECK_EQ(rows[1].traffic.key.process.pid, slow_alpha.process.pid);
+    CHECK_EQ(ProcessStatusText(rows[0].process_alive), L"已结束");
+    CHECK_EQ(ProcessStatusText(rows[1].process_alive), L"运行中");
+    CHECK_EQ(snapshots.size(), 3U);
+    CHECK_EQ(snapshots[1].process_name, L"beta.exe");
+}
+
+void TestVisibleRowsDefaultOrderUsesCombinedSpeedDescending() {
+    const TrafficKey slow{{201, 11}, TransportProtocol::Tcp, ApplicationProtocol::Http};
+    const TrafficKey fast{{202, 22}, TransportProtocol::Udp, ApplicationProtocol::Dns};
+    const TrafficKey medium{{203, 33}, TransportProtocol::Tcp,
+                            ApplicationProtocol::HttpsTls};
+    const std::vector<TrafficSnapshot> snapshots{
+        MakeSnapshot(slow, L"slow.exe", 1.0, 2.0),
+        MakeSnapshot(fast, L"fast.exe", 30.0, 20.0),
+        MakeSnapshot(medium, L"medium.exe", 10.0, 10.0),
+    };
+
+    const auto rows = BuildVisibleRows(
+        snapshots, L"", SortColumn::CombinedSpeed, false,
+        [](ProcessInstanceId) { return true; });
+
+    CHECK_EQ(rows.size(), 3U);
+    CHECK_EQ(rows[0].traffic.key.process.pid, fast.process.pid);
+    CHECK_EQ(rows[1].traffic.key.process.pid, medium.process.pid);
+    CHECK_EQ(rows[2].traffic.key.process.pid, slow.process.pid);
+}
+
 void TestProcessInfoResolvesLiveAndInaccessibleProcesses() {
     ProcessInfoCache cache;
 
@@ -923,6 +971,8 @@ int main(int argc, char** argv) {
     TestTrafficAggregationKeepsApplicationProtocolsSeparate();
     TestTrafficFormatting();
     TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically();
+    TestVisibleRowsFilterWithoutMutatingSnapshotAndAttachLiveness();
+    TestVisibleRowsDefaultOrderUsesCombinedSpeedDescending();
     TestProcessInfoResolvesLiveAndInaccessibleProcesses();
     TestEtwMonitorStartsOneConfiguredConsumer();
     TestEtwMonitorStopsOnlyOwnedResourcesAndStopIsIdempotent();
