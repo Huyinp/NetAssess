@@ -257,6 +257,9 @@ void TestProcessInfoResolvesLiveAndInaccessibleProcesses() {
     CHECK_EQ(current_process.id.creation_time_100ns == 0, false);
     CHECK_EQ(current_process.alive, true);
     CHECK_EQ(cache.RefreshAlive(current_process.id), true);
+    const ProcessInstanceId wrong_creation_time{current_process.id.pid,
+                                                current_process.id.creation_time_100ns + 1};
+    CHECK_EQ(cache.RefreshAlive(wrong_creation_time), false);
 
     constexpr std::uint32_t inaccessible_pid = 0xFFFFFFFFu;
     const auto inaccessible_process = cache.Resolve(inaccessible_pid, 42);
