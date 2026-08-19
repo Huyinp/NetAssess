@@ -1377,29 +1377,30 @@ void TestConnectionRowsFormatAddressesAndClassifyActivity() {
 
 void TestConnectionRowsSortEveryColumnWithBinaryAndKeyTieBreakers() {
     const auto t0 = std::chrono::steady_clock::time_point{};
+    // "443" precedes "80" lexically; ports must use their numeric values.
     ConnectionSnapshot first{
-        MakeConnectionKey({20, 2}, TransportProtocol::Udp, ApplicationProtocol::Dns, 9000, 500,
+        MakeConnectionKey({20, 2}, TransportProtocol::Udp, ApplicationProtocol::Dns, 443, 443,
                           MakeIpv4Address(192, 0, 2, 1), MakeIpv4Address(10, 0, 0, 2)),
-        L"Alpha.exe", 100, 200, 1.0, 2.0, t0};
+        L"Alpha.exe", 100, 200, 10.0, 20.0, t0};
     ConnectionSnapshot second{
-        MakeConnectionKey({10, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http, 1000, 443,
+        MakeConnectionKey({10, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http, 80, 80,
                           MakeIpv4Address(2, 0, 0, 1), MakeIpv4Address(10, 0, 0, 1)),
         L"alpha.exe", 200, 100, 2.0, 1.0, t0 - std::chrono::seconds(6)};
     ConnectionSnapshot tied = first;
     tied.key.process = {30, 3};
 
     const auto rows = BuildConnectionRows({first, second, tied}, true, t0);
-    CHECK_EQ(rows[0].connection.key, second.key);
-    CHECK_EQ(rows[1].connection.key, first.key);
-    CHECK_EQ(rows[2].connection.key, tied.key);
+    CHECK_EQ(rows[0].connection.key, first.key);
+    CHECK_EQ(rows[1].connection.key, tied.key);
+    CHECK_EQ(rows[2].connection.key, second.key);
 
     auto sortable = rows;
-    sortable[0].status = ConnectionActivityStatus::Historical;
-    sortable[0].direction = ConnectionDirection::ReceiveOnly;
-    sortable[1].status = ConnectionActivityStatus::Active;
-    sortable[1].direction = ConnectionDirection::SendOnly;
-    sortable[2].status = ConnectionActivityStatus::Historical;
-    sortable[2].direction = ConnectionDirection::ReceiveOnly;
+    sortable[0].status = ConnectionActivityStatus::Active;
+    sortable[0].direction = ConnectionDirection::SendOnly;
+    sortable[1].status = ConnectionActivityStatus::Historical;
+    sortable[1].direction = ConnectionDirection::ReceiveOnly;
+    sortable[2].status = ConnectionActivityStatus::ProcessEnded;
+    sortable[2].direction = ConnectionDirection::Bidirectional;
     const auto expect_first = [&](ConnectionSortColumn column, const ConnectionKey& expected) {
         auto sorted = sortable;
         SortConnectionRows(sorted, column, true);
@@ -1414,9 +1415,13 @@ void TestConnectionRowsSortEveryColumnWithBinaryAndKeyTieBreakers() {
     expect_first(ConnectionSortColumn::RemoteAddress, second.key);
     expect_first(ConnectionSortColumn::RemotePort, second.key);
     expect_first(ConnectionSortColumn::SentBytes, first.key);
-    expect_first(ConnectionSortColumn::SentRate, first.key);
+    expect_first(ConnectionSortColumn::SentRate, second.key);
     expect_first(ConnectionSortColumn::ReceivedBytes, second.key);
     expect_first(ConnectionSortColumn::ReceivedRate, second.key);
+
+    auto descending = rows;
+    SortConnectionRows(descending, ConnectionSortColumn::SentBytes, false);
+    CHECK_EQ(descending[0].connection.key, second.key);
 
     auto ties = BuildConnectionRows({tied, first}, true, t0);
     SortConnectionRows(ties, ConnectionSortColumn::SentBytes, true);
