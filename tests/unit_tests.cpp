@@ -84,6 +84,8 @@ public:
         close_requested = false;
         query_started = false;
         allow_query = false;
+        stop_started = false;
+        allow_stop = false;
         worker_action_ready = false;
         allow_worker_action = false;
         worker_action_finished = false;
@@ -183,6 +185,11 @@ public:
         calls.emplace_back("control-stop");
         properties->EventsLost = stop_events_lost;
         properties->RealTimeBuffersLost = stop_real_time_buffers_lost;
+        stop_started = true;
+        condition.notify_all();
+        if (block_stop) {
+            condition.wait(lock, [this] { return allow_stop; });
+        }
         if (control_stop_index < control_stop_statuses.size()) {
             return control_stop_statuses[control_stop_index++];
         }
@@ -214,6 +221,18 @@ public:
     void ReleaseQuery() {
         std::lock_guard lock(mutex);
         allow_query = true;
+        condition.notify_all();
+    }
+
+    bool WaitForStop() {
+        std::unique_lock lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds(2),
+                                  [this] { return stop_started; });
+    }
+
+    void ReleaseStop() {
+        std::lock_guard lock(mutex);
+        allow_stop = true;
         condition.notify_all();
     }
 
@@ -275,6 +294,7 @@ public:
     std::size_t control_stop_index{};
     bool block_process_trace{true};
     bool block_query{};
+    bool block_stop{};
 
     int start_trace_calls{};
     int open_trace_calls{};
@@ -308,6 +328,8 @@ private:
     bool close_requested{};
     bool query_started{};
     bool allow_query{};
+    bool stop_started{};
+    bool allow_stop{};
     bool hold_worker_action{};
     bool worker_action_ready{};
     bool allow_worker_action{};
@@ -1127,6 +1149,67 @@ void TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop() {
     }
 }
 
+void TestEtwMonitorSerializesLossCountersWithConsumerCleanup() {
+    TrafficAggregator aggregator;
+    ProcessInfoCache process_cache;
+    FakeEtwSessionApi api;
+    api.block_process_trace = false;
+    api.block_stop = true;
+    api.query_events_lost = 5;
+    api.query_real_time_buffers_lost = 7;
+    api.stop_events_lost = 11;
+    api.stop_real_time_buffers_lost = 13;
+    api.SetProcessTraceAction([] {});
+    api.HoldProcessTraceAction(true);
+    EtwMonitor monitor(aggregator, process_cache, api);
+
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+    CHECK_EQ(api.WaitForWorkerActionReady(), true);
+    const EtwLossCounters queried = monitor.loss_counters();
+    CHECK_EQ(queried.events_lost, 5ULL);
+    CHECK_EQ(queried.real_time_buffers_lost, 7ULL);
+
+    api.ReleaseWorkerAction();
+    CHECK_EQ(api.WaitForStop(), true);
+
+    EtwLossCounters observed{};
+    std::mutex loss_mutex;
+    std::condition_variable loss_condition;
+    bool loss_started{};
+    bool loss_returned{};
+    std::jthread loss_thread([&] {
+        {
+            std::lock_guard lock(loss_mutex);
+            loss_started = true;
+        }
+        loss_condition.notify_all();
+        observed = monitor.loss_counters();
+        {
+            std::lock_guard lock(loss_mutex);
+            loss_returned = true;
+        }
+        loss_condition.notify_all();
+    });
+    {
+        std::unique_lock lock(loss_mutex);
+        CHECK_EQ(loss_condition.wait_for(lock, std::chrono::seconds(2),
+                                         [&] { return loss_started; }),
+                 true);
+        CHECK_EQ(loss_condition.wait_for(lock, std::chrono::milliseconds(100),
+                                         [&] { return loss_returned; }),
+                 false);
+    }
+
+    api.ReleaseStop();
+    loss_thread.join();
+
+    CHECK_EQ(observed.events_lost, 11ULL);
+    CHECK_EQ(observed.real_time_buffers_lost, 13ULL);
+    CHECK_EQ(api.WaitForClose(), true);
+    monitor.Stop();
+}
+
 void TestEtwMonitorExposesRealTimeBufferLossSeparately() {
     TrafficAggregator aggregator;
     ProcessInfoCache process_cache;
@@ -1295,6 +1378,7 @@ int main(int argc, char** argv) {
     TestEtwMonitorCleansOwnedResourcesWhenConsumerFails();
     TestEtwMonitorDoesNotReportSuccessfulPendingStopCodesAsErrors();
     TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop();
+    TestEtwMonitorSerializesLossCountersWithConsumerCleanup();
     TestEtwMonitorExposesRealTimeBufferLossSeparately();
     TestEtwMonitorKeepsFinalLossCountersFromSuccessfulStop();
     TestEtwMonitorRetainsSessionOwnershipAfterFailedStop();

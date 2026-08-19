@@ -186,13 +186,8 @@ bool EtwMonitor::running() const noexcept {
 
 EtwLossCounters EtwMonitor::loss_counters() const {
     std::lock_guard transition_lock(transition_mutex_);
-    if (session_handle_ == 0 || cleanup_started_.load(std::memory_order_acquire)) {
-        return {events_lost_.load(std::memory_order_relaxed),
-                real_time_buffers_lost_.load(std::memory_order_relaxed)};
-    }
-
     std::lock_guard api_lock(api_mutex_);
-    if (cleanup_started_.load(std::memory_order_acquire)) {
+    if (session_handle_ == 0 || cleanup_started_.load(std::memory_order_acquire)) {
         return {events_lost_.load(std::memory_order_relaxed),
                 real_time_buffers_lost_.load(std::memory_order_relaxed)};
     }
