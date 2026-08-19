@@ -57,11 +57,12 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
         return 1;
     }
 
-    TrafficAggregator aggregator;
+    TrafficAggregator traffic_aggregator;
     ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
-    EtwMonitor monitor(aggregator, connection_aggregator, process_cache);
-    HWND window = CreateMainWindow(instance, aggregator, process_cache, monitor);
+    EtwMonitor monitor(traffic_aggregator, connection_aggregator, process_cache);
+    HWND window = CreateMainWindow(instance, traffic_aggregator,
+                                   connection_aggregator, process_cache, monitor);
     if (window == nullptr) {
         MessageBoxW(nullptr, L"无法创建主窗口。", L"NetAssess", MB_OK | MB_ICONERROR);
         return 1;

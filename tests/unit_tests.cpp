@@ -1557,6 +1557,31 @@ void TestVisibleRowsUsesInvariantUnicodeCaseInsensitiveFilter() {
     CHECK_EQ(rows[0].traffic.key.process.pid, process.process.pid);
 }
 
+void TestProcessForVisibleRowReturnsProcessInstanceIdentity() {
+    const ProcessInstanceId first_process{401, 55};
+    const ProcessInstanceId reused_pid{401, 66};
+    const std::vector<TrafficKey> current_keys{
+        {first_process, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls},
+        {first_process, TransportProtocol::Udp, ApplicationProtocol::Quic},
+        {reused_pid, TransportProtocol::Tcp, ApplicationProtocol::Http},
+    };
+
+    const auto first = ProcessForVisibleRow(current_keys, 0);
+    const auto second_protocol = ProcessForVisibleRow(current_keys, 1);
+    const auto reused = ProcessForVisibleRow(current_keys, 2);
+    CHECK_EQ(first.has_value(), true);
+    CHECK_EQ(second_protocol.has_value(), true);
+    CHECK_EQ(reused.has_value(), true);
+    if (first && second_protocol && reused) {
+        CHECK_EQ(first->pid, second_protocol->pid);
+        CHECK_EQ(first->creation_time_100ns, second_protocol->creation_time_100ns);
+        CHECK_EQ(first->pid, reused->pid);
+        CHECK_EQ(first->creation_time_100ns == reused->creation_time_100ns, false);
+    }
+    CHECK_EQ(ProcessForVisibleRow(current_keys, -1).has_value(), false);
+    CHECK_EQ(ProcessForVisibleRow(current_keys, 3).has_value(), false);
+}
+
 void TestProcessInfoResolvesLiveAndInaccessibleProcesses() {
     ProcessInfoCache cache;
 
@@ -2235,6 +2260,7 @@ int main(int argc, char** argv) {
     TestVisibleRowsFilterWithoutMutatingSnapshotAndAttachLiveness();
     TestVisibleRowsDefaultOrderUsesCombinedSpeedDescending();
     TestVisibleRowsUsesInvariantUnicodeCaseInsensitiveFilter();
+    TestProcessForVisibleRowReturnsProcessInstanceIdentity();
     TestProcessInfoResolvesLiveAndInaccessibleProcesses();
     TestProcessInfoFallbackDoesNotMaskRealIdentityOrPidReuse();
     TestProcessInfoCacheUsesCreationTimeOnRealCacheHits();

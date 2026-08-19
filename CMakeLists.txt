@@ -27,7 +27,7 @@ add_library(NetAssessCore STATIC src/protocol_classifier.cpp src/traffic_aggrega
                                   src/connection_aggregator.cpp src/formatting.cpp
                                   src/connection_view.cpp
                                   src/process_info.cpp src/etw_decoder.cpp src/etw_monitor.cpp
-                                  src/main_window.cpp)
+                                  src/main_window.cpp src/connection_window.cpp)
 target_include_directories(NetAssessCore PUBLIC src)
 target_compile_definitions(NetAssessCore PUBLIC _WIN32_WINNT=0x0A00 UNICODE _UNICODE)
 target_compile_options(NetAssessCore PRIVATE /utf-8)

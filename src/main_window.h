@@ -3,6 +3,8 @@
 #include "formatting.h"
 
 #include <functional>
+#include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -15,6 +17,7 @@
 #include <windows.h>
 
 class EtwMonitor;
+class ConnectionAggregator;
 class ProcessInfoCache;
 class TrafficAggregator;
 
@@ -22,7 +25,10 @@ std::vector<TrafficDisplayRow> BuildVisibleRows(
     const std::vector<TrafficSnapshot>& snapshots, std::wstring_view filter,
     SortColumn sort_column, bool ascending,
     const std::function<bool(ProcessInstanceId)>& alive_lookup);
+std::optional<ProcessInstanceId> ProcessForVisibleRow(
+    std::span<const TrafficKey> current_keys, int row);
 
 HWND CreateMainWindow(HINSTANCE instance, TrafficAggregator& aggregator,
+                      ConnectionAggregator& connection_aggregator,
                       ProcessInfoCache& process_cache, EtwMonitor& monitor);
 bool StartMainWindowCollection(HWND window);

@@ -1,9 +1,12 @@
 #include "main_window.h"
 
+#include "connection_aggregator.h"
+#include "connection_window.h"
 #include "etw_monitor.h"
 #include "process_info.h"
 #include "protocol_classifier.h"
 #include "traffic_aggregator.h"
+#include "win32_dpi.h"
 
 #include <algorithm>
 #include <array>
@@ -25,51 +28,7 @@ constexpr UINT kStartCollectionMessage = WM_APP + 1;
 constexpr int kStartStopButtonId = 1001;
 constexpr int kClearButtonId = 1002;
 constexpr int kFilterEditId = 1003;
-constexpr UINT kDefaultDpi = 96;
-
-int ScaleForDpi(int value, UINT dpi) {
-    return MulDiv(value, static_cast<int>(dpi), static_cast<int>(kDefaultDpi));
-}
-
-UINT SystemDpi() {
-    using GetDpiForSystemFunction = UINT(WINAPI*)();
-    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    const auto get_dpi_for_system = reinterpret_cast<GetDpiForSystemFunction>(
-        user32 == nullptr ? nullptr : GetProcAddress(user32, "GetDpiForSystem"));
-    if (get_dpi_for_system != nullptr) {
-        return get_dpi_for_system();
-    }
-
-    HDC screen = GetDC(nullptr);
-    if (screen == nullptr) {
-        return kDefaultDpi;
-    }
-    const UINT dpi = static_cast<UINT>(GetDeviceCaps(screen, LOGPIXELSX));
-    ReleaseDC(nullptr, screen);
-    return dpi == 0 ? kDefaultDpi : dpi;
-}
-
-UINT WindowDpi(HWND window) {
-    using GetDpiForWindowFunction = UINT(WINAPI*)(HWND);
-    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    const auto get_dpi_for_window = reinterpret_cast<GetDpiForWindowFunction>(
-        user32 == nullptr ? nullptr : GetProcAddress(user32, "GetDpiForWindow"));
-    if (get_dpi_for_window != nullptr) {
-        return get_dpi_for_window(window);
-    }
-    return SystemDpi();
-}
-
-void AdjustWindowRectForDpi(RECT& rectangle, DWORD style, DWORD extended_style, UINT dpi) {
-    using AdjustWindowRectExForDpiFunction = BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
-    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    const auto adjust_for_dpi = reinterpret_cast<AdjustWindowRectExForDpiFunction>(
-        user32 == nullptr ? nullptr : GetProcAddress(user32, "AdjustWindowRectExForDpi"));
-    if (adjust_for_dpi == nullptr ||
-        !adjust_for_dpi(&rectangle, style, FALSE, extended_style, dpi)) {
-        AdjustWindowRectEx(&rectangle, style, FALSE, extended_style);
-    }
-}
+constexpr int kViewConnectionDetailsMenuId = 1004;
 
 bool ContainsCaseInsensitive(std::wstring_view value, std::wstring_view filter) {
     if (filter.empty()) {
@@ -110,9 +69,13 @@ std::wstring SystemErrorText(ULONG error) {
 
 class MainWindow {
 public:
-    MainWindow(TrafficAggregator& aggregator, ProcessInfoCache& process_cache,
-               EtwMonitor& monitor)
-        : aggregator_(aggregator), process_cache_(process_cache), monitor_(monitor) {}
+    MainWindow(TrafficAggregator& aggregator,
+               ConnectionAggregator& connection_aggregator,
+               ProcessInfoCache& process_cache, EtwMonitor& monitor)
+        : aggregator_(aggregator),
+          connection_aggregator_(connection_aggregator),
+          process_cache_(process_cache),
+          monitor_(monitor) {}
 
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wparam,
                                             LPARAM lparam) {
@@ -147,7 +110,7 @@ private:
     LRESULT HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         switch (message) {
         case WM_CREATE:
-            dpi_ = WindowDpi(window_);
+            dpi_ = win32_dpi::Window(window_);
             if (!CreateControls()) {
                 return -1;
             }
@@ -163,6 +126,12 @@ private:
         case WM_NOTIFY:
             HandleNotify(reinterpret_cast<NMHDR*>(lparam));
             return 0;
+        case WM_CONTEXTMENU:
+            if (reinterpret_cast<HWND>(wparam) == list_view_) {
+                HandleKeyboardContextMenu(lparam);
+                return 0;
+            }
+            return DefWindowProcW(window_, message, wparam, lparam);
         case WM_TIMER:
             if (wparam == kRefreshTimerId) {
                 RefreshSnapshot();
@@ -173,8 +142,8 @@ private:
             return 0;
         case WM_GETMINMAXINFO: {
             auto* sizing = reinterpret_cast<MINMAXINFO*>(lparam);
-            sizing->ptMinTrackSize.x = ScaleForDpi(760, dpi_);
-            sizing->ptMinTrackSize.y = ScaleForDpi(420, dpi_);
+            sizing->ptMinTrackSize.x = win32_dpi::Scale(760, dpi_);
+            sizing->ptMinTrackSize.y = win32_dpi::Scale(420, dpi_);
             return 0;
         }
         case WM_DPICHANGED: {
@@ -193,6 +162,7 @@ private:
             return started ? TRUE : FALSE;
         }
         case WM_DESTROY:
+            DestroyConnectionWindows();
             if (refresh_timer_ != 0) {
                 KillTimer(window_, refresh_timer_);
                 refresh_timer_ = 0;
@@ -258,7 +228,8 @@ private:
             column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
             column.pszText = const_cast<wchar_t*>(
                 column_names[static_cast<std::size_t>(index)].data());
-            column.cx = ScaleForDpi(column_widths[static_cast<std::size_t>(index)], dpi_);
+            column.cx = win32_dpi::Scale(
+                column_widths[static_cast<std::size_t>(index)], dpi_);
             column.iSubItem = index;
             if (ListView_InsertColumn(list_view_, index, &column) == -1) {
                 return false;
@@ -278,11 +249,11 @@ private:
         RECT status_rectangle{};
         GetWindowRect(status_bar_, &status_rectangle);
         const int status_height = status_rectangle.bottom - status_rectangle.top;
-        const int margin = ScaleForDpi(8, dpi_);
-        const int control_height = ScaleForDpi(28, dpi_);
-        const int button_width = ScaleForDpi(100, dpi_);
-        const int gap = ScaleForDpi(8, dpi_);
-        const int label_width = ScaleForDpi(92, dpi_);
+        const int margin = win32_dpi::Scale(8, dpi_);
+        const int control_height = win32_dpi::Scale(28, dpi_);
+        const int button_width = win32_dpi::Scale(100, dpi_);
+        const int gap = win32_dpi::Scale(8, dpi_);
+        const int label_width = win32_dpi::Scale(92, dpi_);
         const int top = margin;
 
         int left = margin;
@@ -314,6 +285,7 @@ private:
             UpdateStatus();
         } else if (control_id == kClearButtonId && notification == BN_CLICKED) {
             aggregator_.Clear();
+            connection_aggregator_.Clear();
             last_snapshot_.clear();
             RefreshRows();
             UpdateStatus();
@@ -323,19 +295,103 @@ private:
     }
 
     void HandleNotify(const NMHDR* notification) {
-        if (notification == nullptr || notification->hwndFrom != list_view_ ||
-            notification->code != LVN_COLUMNCLICK) {
+        if (notification == nullptr || notification->hwndFrom != list_view_) {
             return;
         }
-        const auto* column_click = reinterpret_cast<const NMLISTVIEW*>(notification);
-        const SortColumn clicked_column = SortColumnForListColumn(column_click->iSubItem);
-        if (sort_column_ == clicked_column) {
-            ascending_ = !ascending_;
-        } else {
-            sort_column_ = clicked_column;
-            ascending_ = true;
+        if (notification->code == LVN_COLUMNCLICK) {
+            const auto* column_click = reinterpret_cast<const NMLISTVIEW*>(notification);
+            const SortColumn clicked_column =
+                SortColumnForListColumn(column_click->iSubItem);
+            if (sort_column_ == clicked_column) {
+                ascending_ = !ascending_;
+            } else {
+                sort_column_ = clicked_column;
+                ascending_ = true;
+            }
+            RefreshRows();
+        } else if (notification->code == NM_RCLICK) {
+            const auto* activate = reinterpret_cast<const NMITEMACTIVATE*>(notification);
+            if (!ProcessForVisibleRow(current_keys_, activate->iItem)) {
+                return;
+            }
+            ListView_SetItemState(list_view_, activate->iItem,
+                                  LVIS_SELECTED | LVIS_FOCUSED,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
+            POINT point{};
+            GetCursorPos(&point);
+            ShowConnectionContextMenu(activate->iItem, point);
         }
-        RefreshRows();
+    }
+
+    void HandleKeyboardContextMenu(LPARAM lparam) {
+        if (lparam != -1) {
+            return;
+        }
+        int row = ListView_GetNextItem(list_view_, -1, LVNI_FOCUSED);
+        if (row < 0) {
+            row = ListView_GetNextItem(list_view_, -1, LVNI_SELECTED);
+        }
+        if (!ProcessForVisibleRow(current_keys_, row)) {
+            return;
+        }
+
+        RECT item_rectangle{};
+        if (!ListView_GetItemRect(list_view_, row, &item_rectangle, LVIR_BOUNDS)) {
+            return;
+        }
+        POINT point{item_rectangle.left, item_rectangle.bottom};
+        ClientToScreen(list_view_, &point);
+        ShowConnectionContextMenu(row, point);
+    }
+
+    void ShowConnectionContextMenu(int row, POINT point) {
+        const auto process = ProcessForVisibleRow(current_keys_, row);
+        if (!process) {
+            return;
+        }
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) {
+            return;
+        }
+        if (AppendMenuW(menu, MF_STRING, kViewConnectionDetailsMenuId,
+                        L"查看连接明细")) {
+            SetForegroundWindow(window_);
+            const int command = TrackPopupMenu(
+                menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0,
+                window_, nullptr);
+            if (command == kViewConnectionDetailsMenuId) {
+                OpenConnectionWindow(*process);
+            }
+        }
+        DestroyMenu(menu);
+    }
+
+    void OpenConnectionWindow(ProcessInstanceId process) {
+        RemoveStaleConnectionWindows();
+        const auto existing = connection_windows_.find(process);
+        if (existing != connection_windows_.end()) {
+            ShowWindow(existing->second, SW_RESTORE);
+            SetForegroundWindow(existing->second);
+            return;
+        }
+
+        const auto snapshot = std::find_if(
+            last_snapshot_.begin(), last_snapshot_.end(),
+            [process](const TrafficSnapshot& value) {
+                return value.key.process == process;
+            });
+        std::wstring process_name =
+            snapshot == last_snapshot_.end() ? L"进程" : snapshot->process_name;
+        const HINSTANCE instance = reinterpret_cast<HINSTANCE>(
+            GetWindowLongPtrW(window_, GWLP_HINSTANCE));
+        HWND detail = CreateConnectionWindow(
+            instance, window_, process, std::move(process_name),
+            connection_aggregator_, process_cache_);
+        if (detail != nullptr) {
+            connection_windows_.emplace(process, detail);
+            ShowWindow(detail, SW_SHOWNORMAL);
+            UpdateWindow(detail);
+        }
     }
 
     std::wstring FilterText() const {
@@ -352,6 +408,7 @@ private:
         last_snapshot_ = aggregator_.Snapshot(std::chrono::steady_clock::now());
         RefreshRows();
         UpdateStatus();
+        RefreshConnectionWindows();
     }
 
     void RefreshRows() {
@@ -504,6 +561,33 @@ private:
         }
     }
 
+    void RemoveStaleConnectionWindows() {
+        for (auto window = connection_windows_.begin();
+             window != connection_windows_.end();) {
+            if (!IsWindow(window->second)) {
+                window = connection_windows_.erase(window);
+            } else {
+                ++window;
+            }
+        }
+    }
+
+    void RefreshConnectionWindows() {
+        RemoveStaleConnectionWindows();
+        for (const auto& entry : connection_windows_) {
+            SendMessageW(entry.second, kConnectionWindowRefreshMessage, 0, 0);
+        }
+    }
+
+    void DestroyConnectionWindows() {
+        for (const auto& entry : connection_windows_) {
+            if (IsWindow(entry.second)) {
+                DestroyWindow(entry.second);
+            }
+        }
+        connection_windows_.clear();
+    }
+
     void UpdateStatus() const {
         if (status_bar_ == nullptr) {
             return;
@@ -517,12 +601,15 @@ private:
             L"  |  实时缓冲区丢失：" +
                 std::to_wstring(loss_counters.real_time_buffers_lost) +
             L"  |  解析失败：" + std::to_wstring(monitor_.parse_failures()) +
+            L"  |  明细丢弃：" +
+                std::to_wstring(connection_aggregator_.dropped_detail_events()) +
             L"  |  最近错误：" + SystemErrorText(monitor_.last_error());
         SendMessageW(status_bar_, SB_SETTEXTW, 0,
                      reinterpret_cast<LPARAM>(status.c_str()));
     }
 
     TrafficAggregator& aggregator_;
+    ConnectionAggregator& connection_aggregator_;
     ProcessInfoCache& process_cache_;
     EtwMonitor& monitor_;
     HWND window_{};
@@ -532,13 +619,14 @@ private:
     HWND filter_edit_{};
     HWND list_view_{};
     HWND status_bar_{};
-    UINT dpi_{kDefaultDpi};
+    UINT dpi_{win32_dpi::kDefaultDpi};
     UINT_PTR refresh_timer_{};
     SortColumn sort_column_{SortColumn::CombinedSpeed};
     bool ascending_{};
     std::vector<TrafficSnapshot> last_snapshot_;
     std::vector<TrafficKey> current_keys_;
     std::map<TrafficKey, int> row_map_;
+    std::map<ProcessInstanceId, HWND> connection_windows_;
 };
 
 bool RegisterWindowClass(HINSTANCE instance) {
@@ -573,7 +661,16 @@ std::vector<TrafficDisplayRow> BuildVisibleRows(
     return rows;
 }
 
+std::optional<ProcessInstanceId> ProcessForVisibleRow(
+    std::span<const TrafficKey> current_keys, int row) {
+    if (row < 0 || static_cast<std::size_t>(row) >= current_keys.size()) {
+        return std::nullopt;
+    }
+    return current_keys[static_cast<std::size_t>(row)].process;
+}
+
 HWND CreateMainWindow(HINSTANCE instance, TrafficAggregator& aggregator,
+                      ConnectionAggregator& connection_aggregator,
                       ProcessInfoCache& process_cache, EtwMonitor& monitor) {
     if (!RegisterWindowClass(instance)) {
         return nullptr;
@@ -581,11 +678,13 @@ HWND CreateMainWindow(HINSTANCE instance, TrafficAggregator& aggregator,
 
     constexpr DWORD style = WS_OVERLAPPEDWINDOW;
     constexpr DWORD extended_style = 0;
-    const UINT dpi = SystemDpi();
-    RECT window_rectangle{0, 0, ScaleForDpi(1050, dpi), ScaleForDpi(620, dpi)};
-    AdjustWindowRectForDpi(window_rectangle, style, extended_style, dpi);
+    const UINT dpi = win32_dpi::System();
+    RECT window_rectangle{0, 0, win32_dpi::Scale(1050, dpi),
+                          win32_dpi::Scale(620, dpi)};
+    win32_dpi::AdjustWindowRect(window_rectangle, style, extended_style, dpi);
 
-    auto* state = new MainWindow(aggregator, process_cache, monitor);
+    auto* state = new MainWindow(aggregator, connection_aggregator,
+                                 process_cache, monitor);
     MainWindow::CreationContext context{state};
     HWND window = CreateWindowExW(
         extended_style, kWindowClassName, L"NetAssess 进程流量监视器", style,
