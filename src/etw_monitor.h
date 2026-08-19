@@ -1,5 +1,6 @@
 #pragma once
 
+#include "connection_aggregator.h"
 #include "etw_decoder.h"
 #include "process_info.h"
 #include "traffic_aggregator.h"
@@ -40,11 +41,13 @@ struct EtwLossCounters {
 
 class EtwMonitor {
 public:
-    EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_cache);
-    EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_cache,
-               IEtwSessionApi& session_api);
-    EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_cache,
-               IEtwSessionApi& session_api, EtwDecoder::SchemaLoader schema_loader);
+    EtwMonitor(TrafficAggregator& aggregator, ConnectionAggregator& connection_aggregator,
+               ProcessInfoCache& process_cache);
+    EtwMonitor(TrafficAggregator& aggregator, ConnectionAggregator& connection_aggregator,
+               ProcessInfoCache& process_cache, IEtwSessionApi& session_api);
+    EtwMonitor(TrafficAggregator& aggregator, ConnectionAggregator& connection_aggregator,
+               ProcessInfoCache& process_cache, IEtwSessionApi& session_api,
+               EtwDecoder::SchemaLoader schema_loader);
     // Lifetime precondition: destruction must occur outside the ETW consumer/callback thread.
     ~EtwMonitor();
 
@@ -75,6 +78,7 @@ private:
     EVENT_TRACE_PROPERTIES* properties() noexcept;
 
     TrafficAggregator& aggregator_;
+    ConnectionAggregator& connection_aggregator_;
     ProcessInfoCache& process_cache_;
     IEtwSessionApi& session_api_;
     EtwDecoder decoder_;

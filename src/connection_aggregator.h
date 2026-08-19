@@ -9,6 +9,12 @@
 #include <mutex>
 #include <vector>
 
+ConnectionKey BuildConnectionKey(ProcessInstanceId process, TransportProtocol transport,
+                                 ApplicationProtocol application_protocol,
+                                 TrafficDirection direction, IpAddress source,
+                                 std::uint16_t source_port, IpAddress destination,
+                                 std::uint16_t destination_port);
+
 class ConnectionAggregator {
 public:
     explicit ConnectionAggregator(std::size_t max_entries = 100000);

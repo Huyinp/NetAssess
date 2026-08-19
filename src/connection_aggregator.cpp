@@ -14,6 +14,19 @@ std::uint64_t SaturatingAdd(std::uint64_t current, std::uint64_t increment) {
 
 }  // namespace
 
+ConnectionKey BuildConnectionKey(ProcessInstanceId process, TransportProtocol transport,
+                                 ApplicationProtocol application_protocol,
+                                 TrafficDirection direction, IpAddress source,
+                                 std::uint16_t source_port, IpAddress destination,
+                                 std::uint16_t destination_port) {
+    if (direction == TrafficDirection::Send) {
+        return {process, transport, application_protocol, {source, source_port},
+                {destination, destination_port}};
+    }
+    return {process, transport, application_protocol, {destination, destination_port},
+            {source, source_port}};
+}
+
 ConnectionAggregator::ConnectionAggregator(std::size_t max_entries) : max_entries_(max_entries) {}
 
 void ConnectionAggregator::Add(const ConnectionEvent& event) {

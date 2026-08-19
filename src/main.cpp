@@ -1,5 +1,6 @@
 #include "main_window.h"
 
+#include "connection_aggregator.h"
 #include "etw_monitor.h"
 #include "process_info.h"
 #include "traffic_aggregator.h"
@@ -57,8 +58,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     }
 
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
-    EtwMonitor monitor(aggregator, process_cache);
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache);
     HWND window = CreateMainWindow(instance, aggregator, process_cache, monitor);
     if (window == nullptr) {
         MessageBoxW(nullptr, L"无法创建主窗口。", L"NetAssess", MB_OK | MB_ICONERROR);

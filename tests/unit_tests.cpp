@@ -403,9 +403,10 @@ public:
 
 int RunEtwMonitorStopInterleavingChild() {
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
-    EtwMonitor monitor(aggregator, process_cache, api);
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
     api.HoldProcessTraceAction(true);
     api.SetProcessTraceAction([&] { monitor.Stop(); });
 
@@ -1549,9 +1550,10 @@ void TestProcessInfoCreationQueryFailureEventuallyDetectsPidReuse() {
 
 void TestEtwMonitorStartsOneConfiguredConsumer() {
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
-    EtwMonitor monitor(aggregator, process_cache, api);
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
 
     CHECK_EQ(monitor.Start(), true);
     CHECK_EQ(api.WaitForConsumers(), true);
@@ -1583,9 +1585,10 @@ void TestEtwMonitorStartsOneConfiguredConsumer() {
 
 void TestEtwMonitorStopsOnlyOwnedResourcesAndStopIsIdempotent() {
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
-    EtwMonitor monitor(aggregator, process_cache, api);
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
 
     CHECK_EQ(monitor.Start(), true);
     CHECK_EQ(api.WaitForConsumers(), true);
@@ -1608,10 +1611,11 @@ void TestEtwMonitorStopsOnlyOwnedResourcesAndStopIsIdempotent() {
 
 void TestEtwMonitorExposesStartTraceFailureWithoutOpeningConsumer() {
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
     api.start_status = ERROR_ACCESS_DENIED;
-    EtwMonitor monitor(aggregator, process_cache, api);
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
 
     CHECK_EQ(monitor.Start(), false);
     CHECK_EQ(monitor.running(), false);
@@ -1625,11 +1629,12 @@ void TestEtwMonitorExposesStartTraceFailureWithoutOpeningConsumer() {
 
 void TestEtwMonitorCleansOwnedSessionWhenOpenTraceFails() {
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
     api.open_error = ERROR_BAD_LENGTH;
     api.trace_handle_to_return = INVALID_PROCESSTRACE_HANDLE;
-    EtwMonitor monitor(aggregator, process_cache, api);
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
 
     CHECK_EQ(monitor.Start(), false);
     CHECK_EQ(monitor.running(), false);
@@ -1649,11 +1654,12 @@ void TestEtwMonitorCleansOwnedSessionWhenOpenTraceFails() {
 
 void TestEtwMonitorCleansOwnedResourcesWhenConsumerFails() {
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
     api.block_process_trace = false;
     api.process_status = ERROR_BAD_LENGTH;
-    EtwMonitor monitor(aggregator, process_cache, api);
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
 
     CHECK_EQ(monitor.Start(), true);
     CHECK_EQ(api.WaitForClose(), true);
@@ -1670,11 +1676,12 @@ void TestEtwMonitorCleansOwnedResourcesWhenConsumerFails() {
 void TestEtwMonitorDoesNotReportSuccessfulPendingStopCodesAsErrors() {
     for (const ULONG stop_status : {ERROR_MORE_DATA, ERROR_ACTIVE_CONNECTIONS}) {
         TrafficAggregator aggregator;
+        ConnectionAggregator connection_aggregator;
         ProcessInfoCache process_cache;
         FakeEtwSessionApi api;
         api.control_status = stop_status;
         api.close_status = ERROR_CTX_CLOSE_PENDING;
-        EtwMonitor monitor(aggregator, process_cache, api);
+        EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
 
         CHECK_EQ(monitor.Start(), true);
         CHECK_EQ(api.WaitForConsumers(), true);
@@ -1687,12 +1694,13 @@ void TestEtwMonitorDoesNotReportSuccessfulPendingStopCodesAsErrors() {
 void TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop() {
     for (int iteration = 0; iteration < 100; ++iteration) {
         TrafficAggregator aggregator;
+        ConnectionAggregator connection_aggregator;
         ProcessInfoCache process_cache;
         FakeEtwSessionApi api;
         api.block_query = true;
         api.query_events_lost = std::numeric_limits<ULONG>::max();
         api.query_real_time_buffers_lost = 17;
-        EtwMonitor monitor(aggregator, process_cache, api);
+        EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
 
         CHECK_EQ(monitor.Start(), true);
         CHECK_EQ(api.WaitForConsumers(), true);
@@ -1727,6 +1735,7 @@ void TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop() {
 
 void TestEtwMonitorSerializesLossCountersWithConsumerCleanup() {
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
     api.block_process_trace = false;
@@ -1737,7 +1746,7 @@ void TestEtwMonitorSerializesLossCountersWithConsumerCleanup() {
     api.stop_real_time_buffers_lost = 13;
     api.SetProcessTraceAction([] {});
     api.HoldProcessTraceAction(true);
-    EtwMonitor monitor(aggregator, process_cache, api);
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
 
     CHECK_EQ(monitor.Start(), true);
     CHECK_EQ(api.WaitForConsumers(), true);
@@ -1788,10 +1797,11 @@ void TestEtwMonitorSerializesLossCountersWithConsumerCleanup() {
 
 void TestEtwMonitorExposesRealTimeBufferLossSeparately() {
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
     api.query_real_time_buffers_lost = 7;
-    EtwMonitor monitor(aggregator, process_cache, api);
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
 
     CHECK_EQ(monitor.Start(), true);
     CHECK_EQ(api.WaitForConsumers(), true);
@@ -1802,11 +1812,12 @@ void TestEtwMonitorExposesRealTimeBufferLossSeparately() {
 
 void TestEtwMonitorKeepsFinalLossCountersFromSuccessfulStop() {
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
     api.stop_events_lost = 11;
     api.stop_real_time_buffers_lost = 13;
-    EtwMonitor monitor(aggregator, process_cache, api);
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
 
     CHECK_EQ(monitor.Start(), true);
     CHECK_EQ(api.WaitForConsumers(), true);
@@ -1817,10 +1828,11 @@ void TestEtwMonitorKeepsFinalLossCountersFromSuccessfulStop() {
 
 void TestEtwMonitorRetainsSessionOwnershipAfterFailedStop() {
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
     api.control_stop_statuses = {ERROR_ACCESS_DENIED, ERROR_SUCCESS};
-    EtwMonitor monitor(aggregator, process_cache, api);
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
 
     CHECK_EQ(monitor.Start(), true);
     CHECK_EQ(api.WaitForConsumers(), true);
@@ -1835,12 +1847,100 @@ void TestEtwMonitorRetainsSessionOwnershipAfterFailedStop() {
     CHECK_EQ(api.start_trace_calls, 1);
 }
 
+void TestEtwMonitorActualCallbackAggregatesCanonicalConnection() {
+    constexpr std::uint32_t pid = 1234;
+    constexpr std::uint16_t local_port = 50000;
+    constexpr std::uint16_t remote_port = 443;
+    constexpr std::uint64_t sent_bytes = 2048;
+    constexpr std::uint64_t received_bytes = 1024;
+    const ProcessInstanceId process_id{pid, 55};
+    const auto t0 = std::chrono::steady_clock::time_point{};
+
+    TrafficAggregator traffic_aggregator;
+    ConnectionAggregator connection_aggregator;
+    FakeProcessInfoApi process_api;
+    process_api.query_results = {ProcessInfo{process_id, L"browser.exe", true}};
+    process_api.creation_time = process_id.creation_time_100ns;
+    ProcessInfoCache process_cache(process_api);
+    FakeEtwSessionApi api;
+    EtwMonitor monitor(
+        traffic_aggregator, connection_aggregator, process_cache, api,
+        [](const EVENT_RECORD& record) -> std::optional<EventLayout> {
+            const auto opcode = record.EventHeader.EventDescriptor.Opcode;
+            if (opcode == EVENT_TRACE_TYPE_SEND) {
+                return MakeIpv4Layout(TrafficDirection::Send, TransportProtocol::Tcp);
+            }
+            if (opcode == EVENT_TRACE_TYPE_RECEIVE) {
+                return MakeIpv4Layout(TrafficDirection::Receive, TransportProtocol::Tcp);
+            }
+            return std::nullopt;
+        });
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+
+    std::array send_payload{
+        std::byte{0xD2}, std::byte{0x04}, std::byte{0x00}, std::byte{0x00},
+        std::byte{0x00}, std::byte{0x08}, std::byte{0x00}, std::byte{0x00},
+        std::byte{198}, std::byte{51}, std::byte{100}, std::byte{2},
+        std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1},
+        std::byte{0x01}, std::byte{0xBB}, std::byte{0xC3}, std::byte{0x50},
+    };
+    EVENT_RECORD send_record{};
+    send_record.EventHeader.ProviderId =
+        GUID{0x9a280ac0, 0xc8e0, 0x11d1, {0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2}};
+    send_record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_SEND;
+    send_record.EventHeader.Flags = EVENT_HEADER_FLAG_64_BIT_HEADER;
+    send_record.EventHeader.TimeStamp.QuadPart = 100;
+    send_record.UserData = send_payload.data();
+    send_record.UserDataLength = static_cast<USHORT>(send_payload.size());
+    api.InvokeEventCallback(send_record);
+
+    const auto process_rows = traffic_aggregator.Snapshot(t0);
+    const auto detail_rows = connection_aggregator.Snapshot(process_id, t0);
+    CHECK_EQ(process_rows.size(), 1ULL);
+    CHECK_EQ(detail_rows.size(), 1ULL);
+    if (!detail_rows.empty()) {
+        CHECK_EQ(detail_rows[0].key.local.port, local_port);
+        CHECK_EQ(detail_rows[0].key.remote.port, remote_port);
+        CHECK_EQ(detail_rows[0].sent_bytes, sent_bytes);
+    }
+
+    std::array receive_payload{
+        std::byte{0xD2}, std::byte{0x04}, std::byte{0x00}, std::byte{0x00},
+        std::byte{0x00}, std::byte{0x04}, std::byte{0x00}, std::byte{0x00},
+        std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1},
+        std::byte{198}, std::byte{51}, std::byte{100}, std::byte{2},
+        std::byte{0xC3}, std::byte{0x50}, std::byte{0x01}, std::byte{0xBB},
+    };
+    EVENT_RECORD receive_record{};
+    receive_record.EventHeader.ProviderId = send_record.EventHeader.ProviderId;
+    receive_record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_RECEIVE;
+    receive_record.EventHeader.Flags = EVENT_HEADER_FLAG_64_BIT_HEADER;
+    receive_record.EventHeader.TimeStamp.QuadPart = 200;
+    receive_record.UserData = receive_payload.data();
+    receive_record.UserDataLength = static_cast<USHORT>(receive_payload.size());
+    api.InvokeEventCallback(receive_record);
+
+    const auto detail_rows_after_receive = connection_aggregator.Snapshot(process_id, t0);
+    CHECK_EQ(detail_rows_after_receive.size(), 1ULL);
+    if (!detail_rows_after_receive.empty()) {
+        CHECK_EQ(detail_rows_after_receive[0].key.local.port, local_port);
+        CHECK_EQ(detail_rows_after_receive[0].key.remote.port, remote_port);
+        CHECK_EQ(detail_rows_after_receive[0].sent_bytes, sent_bytes);
+        CHECK_EQ(detail_rows_after_receive[0].received_bytes, received_bytes);
+    }
+    CHECK_EQ(process_api.query_process_calls, 1);
+    CHECK_EQ(process_api.query_creation_time_calls, 1);
+    monitor.Stop();
+}
+
 void TestEtwMonitorCallbackContainsExceptionsAndStopsSafely() {
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
     EtwMonitor monitor(
-        aggregator, process_cache, api,
+        aggregator, connection_aggregator, process_cache, api,
         [](const EVENT_RECORD&) -> std::optional<EventLayout> {
             throw std::runtime_error("schema failure");
         });
@@ -1865,9 +1965,10 @@ void TestEtwMonitorCallbackContainsExceptionsAndStopsSafely() {
 
 void TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart() {
     TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
     ProcessInfoCache process_cache;
     FakeEtwSessionApi api;
-    EtwMonitor monitor(aggregator, process_cache, api);
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
     api.SetProcessTraceAction([&] { monitor.Stop(); });
 
     CHECK_EQ(monitor.Start(), true);
@@ -1973,6 +2074,7 @@ int main(int argc, char** argv) {
     TestEtwMonitorExposesRealTimeBufferLossSeparately();
     TestEtwMonitorKeepsFinalLossCountersFromSuccessfulStop();
     TestEtwMonitorRetainsSessionOwnershipAfterFailedStop();
+    TestEtwMonitorActualCallbackAggregatesCanonicalConnection();
     TestEtwMonitorCallbackContainsExceptionsAndStopsSafely();
     TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart();
     TestEtwMonitorExternalJoinDoesNotBlockConsumerThreadStop();
