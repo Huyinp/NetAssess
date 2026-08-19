@@ -13,7 +13,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
+#include <cwchar>
 #include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -25,6 +28,7 @@
 
 #define NOMINMAX
 #include <windows.h>
+#include <tdh.h>
 
 namespace {
 
@@ -449,15 +453,68 @@ EventLayout MakeIpv4Layout(TrafficDirection direction, TransportProtocol transpo
     EventLayout layout{};
     layout.pid = {0, 4};
     layout.size = {4, 4};
-    layout.source_address = {8, 4};
-    layout.destination_address = {12, 4};
-    layout.source_port = {16, 2};
-    layout.destination_port = {18, 2};
+    layout.destination_address = {8, 4};
+    layout.source_address = {12, 4};
+    layout.destination_port = {16, 2};
+    layout.source_port = {18, 2};
     layout.direction = direction;
     layout.transport = transport;
     layout.address_family = IpAddressFamily::V4;
     return layout;
 }
+
+struct SchemaProperty {
+    const wchar_t* name;
+    USHORT in_type;
+    USHORT length{};
+    PROPERTY_FLAGS flags{};
+};
+
+class SchemaFixture final {
+public:
+    explicit SchemaFixture(std::initializer_list<SchemaProperty> properties) {
+        auto* information = reinterpret_cast<TRACE_EVENT_INFO*>(buffer_.data());
+        information->PropertyCount = static_cast<ULONG>(properties.size());
+        information->TopLevelPropertyCount = static_cast<ULONG>(properties.size());
+
+        std::size_t name_offset = offsetof(TRACE_EVENT_INFO, EventPropertyInfoArray) +
+                                  properties.size() * sizeof(EVENT_PROPERTY_INFO);
+        std::size_t index = 0;
+        for (const auto& definition : properties) {
+            auto& property = information->EventPropertyInfoArray[index++];
+            property.Flags = definition.flags;
+            property.nonStructType.InType = definition.in_type;
+            property.length = definition.length;
+            property.count = 1;
+            property.NameOffset = static_cast<ULONG>(name_offset);
+
+            const std::size_t name_size = std::wcslen(definition.name) + 1;
+            std::memcpy(buffer_.data() + name_offset, definition.name,
+                        name_size * sizeof(wchar_t));
+            name_offset += name_size * sizeof(wchar_t);
+        }
+        size_ = name_offset;
+    }
+
+    std::span<const std::byte> bytes() const { return {buffer_.data(), size_}; }
+
+private:
+    alignas(TRACE_EVENT_INFO) std::array<std::byte, 1024> buffer_{};
+    std::size_t size_{};
+};
+
+EVENT_RECORD MakeNetworkRecord(const GUID& provider, std::uint8_t opcode) {
+    EVENT_RECORD record{};
+    record.EventHeader.ProviderId = provider;
+    record.EventHeader.EventDescriptor.Opcode = opcode;
+    record.EventHeader.Flags = EVENT_HEADER_FLAG_64_BIT_HEADER;
+    return record;
+}
+
+constexpr GUID kTestTcpIpProvider{0x9a280ac0, 0xc8e0, 0x11d1,
+                                  {0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2}};
+constexpr GUID kTestUdpIpProvider{0xbf3a50c5, 0xa9c9, 0x4988,
+                                  {0xa0, 0x05, 0x2d, 0xf0, 0xb7, 0xc8, 0x0f, 0x80}};
 
 void TestTrafficAggregationKeepsDistinctKeysAndDirectionsSeparate() {
     TrafficAggregator aggregator;
@@ -495,7 +552,7 @@ void TestEtwPayloadDecodeIsBoundedAndUsesNetworkOrderPorts() {
         std::byte{0x04}, std::byte{0x03}, std::byte{0x02}, std::byte{0x01},
         std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
         std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
-        std::byte{0x12}, std::byte{0x34}, std::byte{0xAB}, std::byte{0xCD},
+        std::byte{0xAB}, std::byte{0xCD}, std::byte{0x12}, std::byte{0x34},
     };
 
     const auto decoded = DecodePayload(layout, payload);
@@ -530,10 +587,10 @@ void TestEtwPayloadDecodeCopiesIpv4EndpointAddresses() {
     EventLayout ipv4{};
     ipv4.pid = {0, 4};
     ipv4.size = {4, 4};
-    ipv4.source_address = {8, 4};
-    ipv4.destination_address = {12, 4};
-    ipv4.source_port = {16, 2};
-    ipv4.destination_port = {18, 2};
+    ipv4.destination_address = {8, 4};
+    ipv4.source_address = {12, 4};
+    ipv4.destination_port = {16, 2};
+    ipv4.source_port = {18, 2};
     ipv4.direction = TrafficDirection::Send;
     ipv4.transport = TransportProtocol::Tcp;
     ipv4.address_family = IpAddressFamily::V4;
@@ -541,9 +598,9 @@ void TestEtwPayloadDecodeCopiesIpv4EndpointAddresses() {
     const std::array payload{
         std::byte{0x78}, std::byte{0x56}, std::byte{0x34}, std::byte{0x12},
         std::byte{0x04}, std::byte{0x03}, std::byte{0x02}, std::byte{0x01},
-        std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1},
         std::byte{198}, std::byte{51}, std::byte{100}, std::byte{2},
-        std::byte{0x12}, std::byte{0x34}, std::byte{0xAB}, std::byte{0xCD},
+        std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1},
+        std::byte{0xAB}, std::byte{0xCD}, std::byte{0x12}, std::byte{0x34},
     };
     const std::array<std::byte, 16> expected_source{
         std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1}};
@@ -574,10 +631,10 @@ void TestEtwPayloadDecodeCopiesIpv6EndpointAddresses() {
     EventLayout ipv6{};
     ipv6.pid = {0, 4};
     ipv6.size = {4, 4};
-    ipv6.source_address = {8, 16};
-    ipv6.destination_address = {24, 16};
-    ipv6.source_port = {40, 2};
-    ipv6.destination_port = {42, 2};
+    ipv6.destination_address = {8, 16};
+    ipv6.source_address = {24, 16};
+    ipv6.destination_port = {40, 2};
+    ipv6.source_port = {42, 2};
     ipv6.direction = TrafficDirection::Receive;
     ipv6.transport = TransportProtocol::Udp;
     ipv6.address_family = IpAddressFamily::V6;
@@ -588,12 +645,12 @@ void TestEtwPayloadDecodeCopiesIpv6EndpointAddresses() {
         std::byte{0x20}, std::byte{0x01}, std::byte{0x0D}, std::byte{0xB8},
         std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
         std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
-        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{2},
         std::byte{0x20}, std::byte{0x01}, std::byte{0x0D}, std::byte{0xB8},
         std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
         std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
-        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{2},
-        std::byte{0}, std::byte{0x35}, std::byte{0xC0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1},
+        std::byte{0xC0}, std::byte{0}, std::byte{0}, std::byte{0x35},
     };
     const std::array<std::byte, 16> expected_source{
         std::byte{0x20}, std::byte{0x01}, std::byte{0x0D}, std::byte{0xB8},
@@ -633,6 +690,135 @@ void TestEtwPayloadDecodeCopiesIpv6EndpointAddresses() {
     CHECK_EQ(DecodePayload(wrong_width, wrong_width_payload).has_value(), false);
 }
 
+void TestParseEventLayoutMapsActualTcpIpv4MofOrder() {
+    const SchemaFixture schema{{L"PID", TDH_INTYPE_UINT32},
+                               {L"size", TDH_INTYPE_UINT32},
+                               {L"daddr", TDH_INTYPE_BINARY, 4},
+                               {L"saddr", TDH_INTYPE_BINARY, 4},
+                               {L"dport", TDH_INTYPE_UINT16},
+                               {L"sport", TDH_INTYPE_UINT16}};
+    const auto record = MakeNetworkRecord(kTestTcpIpProvider, EVENT_TRACE_TYPE_SEND);
+    const auto layout = ParseEventLayout(record, schema.bytes());
+
+    CHECK_EQ(layout.has_value(), true);
+    if (!layout) {
+        return;
+    }
+    CHECK_EQ(layout->destination_address.offset, 8U);
+    CHECK_EQ(layout->source_address.offset, 12U);
+    CHECK_EQ(layout->destination_port.offset, 16U);
+    CHECK_EQ(layout->source_port.offset, 18U);
+    CHECK_EQ(static_cast<int>(layout->address_family), static_cast<int>(IpAddressFamily::V4));
+
+    const std::array payload{
+        std::byte{0x78}, std::byte{0x56}, std::byte{0x34}, std::byte{0x12},
+        std::byte{0x04}, std::byte{0x03}, std::byte{0x02}, std::byte{0x01},
+        std::byte{198}, std::byte{51}, std::byte{100}, std::byte{2},
+        std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1},
+        std::byte{0xAB}, std::byte{0xCD}, std::byte{0x12}, std::byte{0x34},
+    };
+    const auto decoded = DecodePayload(*layout, payload);
+    CHECK_EQ(decoded.has_value(), true);
+    if (decoded) {
+        CHECK_EQ(std::to_integer<int>(decoded->source_address.bytes[0]), 192);
+        CHECK_EQ(std::to_integer<int>(decoded->source_address.bytes[3]), 1);
+        CHECK_EQ(std::to_integer<int>(decoded->destination_address.bytes[0]), 198);
+        CHECK_EQ(std::to_integer<int>(decoded->destination_address.bytes[3]), 2);
+        CHECK_EQ(decoded->source_port, 0x1234U);
+        CHECK_EQ(decoded->destination_port, 0xABCDU);
+    }
+}
+
+void TestParseEventLayoutMapsActualUdpIpv6MofOrder() {
+    const SchemaFixture schema{{L"PID", TDH_INTYPE_UINT32},
+                               {L"size", TDH_INTYPE_UINT32},
+                               {L"daddr", TDH_INTYPE_BINARY, 16},
+                               {L"saddr", TDH_INTYPE_BINARY, 16},
+                               {L"dport", TDH_INTYPE_UINT16},
+                               {L"sport", TDH_INTYPE_UINT16}};
+    const auto record = MakeNetworkRecord(
+        kTestUdpIpProvider, static_cast<std::uint8_t>(EVENT_TRACE_TYPE_RECEIVE + 16));
+    const auto layout = ParseEventLayout(record, schema.bytes());
+
+    CHECK_EQ(layout.has_value(), true);
+    if (!layout) {
+        return;
+    }
+    CHECK_EQ(layout->destination_address.offset, 8U);
+    CHECK_EQ(layout->source_address.offset, 24U);
+    CHECK_EQ(layout->destination_port.offset, 40U);
+    CHECK_EQ(layout->source_port.offset, 42U);
+    CHECK_EQ(static_cast<int>(layout->address_family), static_cast<int>(IpAddressFamily::V6));
+
+    const std::array payload{
+        std::byte{0x2A}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0x40}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0x20}, std::byte{0x01}, std::byte{0x0D}, std::byte{0xB8},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{2},
+        std::byte{0x20}, std::byte{0x01}, std::byte{0x0D}, std::byte{0xB8},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1},
+        std::byte{0xC0}, std::byte{0}, std::byte{0}, std::byte{0x35},
+    };
+    const auto decoded = DecodePayload(*layout, payload);
+    CHECK_EQ(decoded.has_value(), true);
+    if (decoded) {
+        CHECK_EQ(std::to_integer<int>(decoded->source_address.bytes[0]), 0x20);
+        CHECK_EQ(std::to_integer<int>(decoded->source_address.bytes[15]), 1);
+        CHECK_EQ(std::to_integer<int>(decoded->destination_address.bytes[0]), 0x20);
+        CHECK_EQ(std::to_integer<int>(decoded->destination_address.bytes[15]), 2);
+        CHECK_EQ(decoded->source_port, 53U);
+        CHECK_EQ(decoded->destination_port, 49152U);
+    }
+}
+
+void TestParseEventLayoutRejectsTargetAddressWidthMismatch() {
+    const SchemaFixture schema{{L"PID", TDH_INTYPE_UINT32},
+                               {L"size", TDH_INTYPE_UINT32},
+                               {L"daddr", TDH_INTYPE_BINARY, 16},
+                               {L"saddr", TDH_INTYPE_BINARY, 4},
+                               {L"dport", TDH_INTYPE_UINT16},
+                               {L"sport", TDH_INTYPE_UINT16}};
+    const auto record = MakeNetworkRecord(kTestTcpIpProvider, EVENT_TRACE_TYPE_SEND);
+    CHECK_EQ(ParseEventLayout(record, schema.bytes()).has_value(), false);
+}
+
+void TestParseEventLayoutRejectsDuplicateTargetAddressProperty() {
+    const SchemaFixture schema{{L"PID", TDH_INTYPE_UINT32},
+                               {L"size", TDH_INTYPE_UINT32},
+                               {L"daddr", TDH_INTYPE_BINARY, 4},
+                               {L"saddr", TDH_INTYPE_BINARY, 4},
+                               {L"SADDR", TDH_INTYPE_BINARY, 4},
+                               {L"dport", TDH_INTYPE_UINT16},
+                               {L"sport", TDH_INTYPE_UINT16}};
+    const auto record = MakeNetworkRecord(kTestTcpIpProvider, EVENT_TRACE_TYPE_SEND);
+    CHECK_EQ(ParseEventLayout(record, schema.bytes()).has_value(), false);
+}
+
+void TestParseEventLayoutRejectsMissingTargetAddressProperty() {
+    const SchemaFixture schema{{L"PID", TDH_INTYPE_UINT32},
+                               {L"size", TDH_INTYPE_UINT32},
+                               {L"daddr", TDH_INTYPE_BINARY, 4},
+                               {L"dport", TDH_INTYPE_UINT16},
+                               {L"sport", TDH_INTYPE_UINT16}};
+    const auto record = MakeNetworkRecord(kTestTcpIpProvider, EVENT_TRACE_TYPE_SEND);
+    CHECK_EQ(ParseEventLayout(record, schema.bytes()).has_value(), false);
+}
+
+void TestParseEventLayoutRejectsVariableTargetAddressProperty() {
+    const SchemaFixture schema{{L"PID", TDH_INTYPE_UINT32},
+                               {L"size", TDH_INTYPE_UINT32},
+                               {L"daddr", TDH_INTYPE_BINARY, 4},
+                               {L"saddr", TDH_INTYPE_BINARY, 4, PropertyParamLength},
+                               {L"dport", TDH_INTYPE_UINT16},
+                               {L"sport", TDH_INTYPE_UINT16}};
+    const auto record = MakeNetworkRecord(kTestTcpIpProvider, EVENT_TRACE_TYPE_SEND);
+    CHECK_EQ(ParseEventLayout(record, schema.bytes()).has_value(), false);
+}
+
 void TestEtwDecoderCachesLayoutsBySchemaKey() {
     const EventLayout layout = MakeIpv4Layout(TrafficDirection::Receive, TransportProtocol::Udp);
     const std::array payload{
@@ -640,7 +826,7 @@ void TestEtwDecoderCachesLayoutsBySchemaKey() {
         std::byte{0x40}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
         std::byte{127}, std::byte{0}, std::byte{0}, std::byte{1},
         std::byte{127}, std::byte{0}, std::byte{0}, std::byte{1},
-        std::byte{0x00}, std::byte{0x35}, std::byte{0xC0}, std::byte{0x00},
+        std::byte{0xC0}, std::byte{0x00}, std::byte{0x00}, std::byte{0x35},
     };
     int load_count = 0;
     EtwDecoder decoder([&](const EVENT_RECORD&) -> std::optional<EventLayout> {
@@ -683,33 +869,30 @@ void TestEtwDecoderCachesLayoutsBySchemaKey() {
     CHECK_EQ(decoder.cached_layout_count(), 3U);
 }
 
-void TestEtwDecoderCachesAddressWidthFailuresAndCountsEveryFailedEvent() {
-    EventLayout layout = MakeIpv4Layout(TrafficDirection::Send, TransportProtocol::Tcp);
-    layout.source_address.width = 16;
-    const std::array payload{
-        std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0},
-        std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0},
-        std::byte{127}, std::byte{0}, std::byte{0}, std::byte{1},
-        std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1},
-        std::byte{0}, std::byte{80}, std::byte{0x01}, std::byte{0xBB},
-    };
+void TestEtwDecoderCachesFailedParsedAddressSchemasOnlyForTargetEvents() {
+    const SchemaFixture schema{{L"PID", TDH_INTYPE_UINT32},
+                               {L"size", TDH_INTYPE_UINT32},
+                               {L"daddr", TDH_INTYPE_BINARY, 16},
+                               {L"saddr", TDH_INTYPE_BINARY, 4},
+                               {L"dport", TDH_INTYPE_UINT16},
+                               {L"sport", TDH_INTYPE_UINT16}};
     int load_count = 0;
-    EtwDecoder decoder([&](const EVENT_RECORD&) -> std::optional<EventLayout> {
+    EtwDecoder decoder([&](const EVENT_RECORD& record) -> std::optional<EventLayout> {
         ++load_count;
-        return layout;
+        return ParseEventLayout(record, schema.bytes());
     });
-    EVENT_RECORD record{};
-    record.EventHeader.ProviderId =
-        GUID{0x9a280ac0, 0xc8e0, 0x11d1, {0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2}};
-    record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_SEND;
-    record.EventHeader.Flags = EVENT_HEADER_FLAG_64_BIT_HEADER;
-    record.UserData = const_cast<std::byte*>(payload.data());
-    record.UserDataLength = static_cast<USHORT>(payload.size());
+    const auto record = MakeNetworkRecord(kTestTcpIpProvider, EVENT_TRACE_TYPE_SEND);
 
     CHECK_EQ(decoder.Decode(record).has_value(), false);
     CHECK_EQ(decoder.Decode(record).has_value(), false);
     CHECK_EQ(load_count, 1);
     CHECK_EQ(decoder.cached_layout_count(), 1U);
+    CHECK_EQ(decoder.parse_failures(), 2ULL);
+
+    auto ignored = record;
+    ignored.EventHeader.ProviderId = GUID_NULL;
+    CHECK_EQ(decoder.Decode(ignored).has_value(), false);
+    CHECK_EQ(load_count, 1);
     CHECK_EQ(decoder.parse_failures(), 2ULL);
 }
 
@@ -1519,8 +1702,14 @@ int main(int argc, char** argv) {
     TestEtwPayloadDecodeIsBoundedAndUsesNetworkOrderPorts();
     TestEtwPayloadDecodeCopiesIpv4EndpointAddresses();
     TestEtwPayloadDecodeCopiesIpv6EndpointAddresses();
+    TestParseEventLayoutMapsActualTcpIpv4MofOrder();
+    TestParseEventLayoutMapsActualUdpIpv6MofOrder();
+    TestParseEventLayoutRejectsTargetAddressWidthMismatch();
+    TestParseEventLayoutRejectsDuplicateTargetAddressProperty();
+    TestParseEventLayoutRejectsMissingTargetAddressProperty();
+    TestParseEventLayoutRejectsVariableTargetAddressProperty();
     TestEtwDecoderCachesLayoutsBySchemaKey();
-    TestEtwDecoderCachesAddressWidthFailuresAndCountsEveryFailedEvent();
+    TestEtwDecoderCachesFailedParsedAddressSchemasOnlyForTargetEvents();
     TestEtwDecoderCachesInvalidLayoutsAndCountsEveryFailedEvent();
     TestEtwDecoderIgnoresNonNetworkAndNonDataEvents();
     TestSyntheticRecordFlowsThroughDecodeResolveClassifyAndAggregate();

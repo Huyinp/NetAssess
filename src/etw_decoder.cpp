@@ -158,59 +158,11 @@ std::optional<EventLayout> LoadEventLayout(const EVENT_RECORD& record) {
         return std::nullopt;
     }
 
-    constexpr std::size_t property_array_offset =
-        offsetof(TRACE_EVENT_INFO, EventPropertyInfoArray);
-    if (buffer_size > buffer.size() || buffer_size < property_array_offset ||
-        information->TopLevelPropertyCount > information->PropertyCount ||
-        information->TopLevelPropertyCount >
-            (buffer_size - property_array_offset) / sizeof(EVENT_PROPERTY_INFO)) {
+    if (buffer_size > buffer.size()) {
         return std::nullopt;
     }
 
-    EventLayout layout;
-    layout.direction = classification->first;
-    layout.transport = classification->second;
-    layout.address_family = AddressFamilyForOpcode(record.EventHeader.EventDescriptor.Opcode);
-    std::size_t offset = 0;
-    const std::uint16_t header_flags = record.EventHeader.Flags &
-                                       (EVENT_HEADER_FLAG_32_BIT_HEADER |
-                                        EVENT_HEADER_FLAG_64_BIT_HEADER);
-    for (ULONG index = 0; index < information->TopLevelPropertyCount; ++index) {
-        const auto& property = information->EventPropertyInfoArray[index];
-        const auto width = FixedPropertyWidth(property, header_flags);
-        const wchar_t* name = PropertyName(*information, buffer_size, property);
-        if (!width || !name || offset > std::numeric_limits<std::size_t>::max() - *width) {
-            return std::nullopt;
-        }
-
-        bool accepted = true;
-        if (_wcsicmp(name, L"PID") == 0) {
-            accepted = SetField(layout.pid, offset, *width);
-        } else if (_wcsicmp(name, L"size") == 0) {
-            accepted = SetField(layout.size, offset, *width);
-        } else if (_wcsicmp(name, L"saddr") == 0) {
-            accepted = SetField(layout.source_address, offset, *width);
-        } else if (_wcsicmp(name, L"daddr") == 0) {
-            accepted = SetField(layout.destination_address, offset, *width);
-        } else if (_wcsicmp(name, L"sport") == 0) {
-            accepted = SetField(layout.source_port, offset, *width);
-        } else if (_wcsicmp(name, L"dport") == 0) {
-            accepted = SetField(layout.destination_port, offset, *width);
-        }
-        if (!accepted) {
-            return std::nullopt;
-        }
-        offset += *width;
-    }
-
-    const std::size_t address_width = layout.address_family == IpAddressFamily::V4 ? 4 : 16;
-    if (layout.pid.width != 4 || layout.size.width != 4 ||
-        layout.source_address.width != address_width ||
-        layout.destination_address.width != address_width || layout.source_port.width != 2 ||
-        layout.destination_port.width != 2) {
-        return std::nullopt;
-    }
-    return layout;
+    return ParseEventLayout(record, {buffer.data(), buffer_size});
 }
 
 bool Contains(std::span<const std::byte> payload, const FieldLayout& field) {
@@ -255,6 +207,69 @@ std::optional<IpAddress> ReadAddress(std::span<const std::byte> payload,
 }
 
 }  // namespace
+
+std::optional<EventLayout> ParseEventLayout(const EVENT_RECORD& record,
+                                            std::span<const std::byte> information_buffer) {
+    const auto classification = Classify(record);
+    constexpr std::size_t property_array_offset =
+        offsetof(TRACE_EVENT_INFO, EventPropertyInfoArray);
+    if (!classification || information_buffer.size() < property_array_offset) {
+        return std::nullopt;
+    }
+
+    const auto* information =
+        reinterpret_cast<const TRACE_EVENT_INFO*>(information_buffer.data());
+    if (information->TopLevelPropertyCount > information->PropertyCount ||
+        information->TopLevelPropertyCount >
+            (information_buffer.size() - property_array_offset) / sizeof(EVENT_PROPERTY_INFO)) {
+        return std::nullopt;
+    }
+
+    EventLayout layout;
+    layout.direction = classification->first;
+    layout.transport = classification->second;
+    layout.address_family = AddressFamilyForOpcode(record.EventHeader.EventDescriptor.Opcode);
+    std::size_t offset = 0;
+    const std::uint16_t header_flags = record.EventHeader.Flags &
+                                       (EVENT_HEADER_FLAG_32_BIT_HEADER |
+                                        EVENT_HEADER_FLAG_64_BIT_HEADER);
+    for (ULONG index = 0; index < information->TopLevelPropertyCount; ++index) {
+        const auto& property = information->EventPropertyInfoArray[index];
+        const auto width = FixedPropertyWidth(property, header_flags);
+        const wchar_t* name = PropertyName(*information, information_buffer.size(), property);
+        if (!width || !name || offset > std::numeric_limits<std::size_t>::max() - *width) {
+            return std::nullopt;
+        }
+
+        bool accepted = true;
+        if (_wcsicmp(name, L"PID") == 0) {
+            accepted = SetField(layout.pid, offset, *width);
+        } else if (_wcsicmp(name, L"size") == 0) {
+            accepted = SetField(layout.size, offset, *width);
+        } else if (_wcsicmp(name, L"saddr") == 0) {
+            accepted = SetField(layout.source_address, offset, *width);
+        } else if (_wcsicmp(name, L"daddr") == 0) {
+            accepted = SetField(layout.destination_address, offset, *width);
+        } else if (_wcsicmp(name, L"sport") == 0) {
+            accepted = SetField(layout.source_port, offset, *width);
+        } else if (_wcsicmp(name, L"dport") == 0) {
+            accepted = SetField(layout.destination_port, offset, *width);
+        }
+        if (!accepted) {
+            return std::nullopt;
+        }
+        offset += *width;
+    }
+
+    const std::size_t address_width = layout.address_family == IpAddressFamily::V4 ? 4 : 16;
+    if (layout.pid.width != 4 || layout.size.width != 4 ||
+        layout.source_address.width != address_width ||
+        layout.destination_address.width != address_width || layout.source_port.width != 2 ||
+        layout.destination_port.width != 2) {
+        return std::nullopt;
+    }
+    return layout;
+}
 
 std::optional<DecodedNetworkEvent> DecodePayload(const EventLayout& layout,
                                                  std::span<const std::byte> payload) {

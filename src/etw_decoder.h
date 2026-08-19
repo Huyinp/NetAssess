@@ -45,6 +45,9 @@ struct DecodedNetworkEvent {
     std::uint64_t bytes{};
 };
 
+std::optional<EventLayout> ParseEventLayout(const EVENT_RECORD& record,
+                                            std::span<const std::byte> information_buffer);
+
 std::optional<DecodedNetworkEvent> DecodePayload(
     const EventLayout& layout, std::span<const std::byte> payload);
 
