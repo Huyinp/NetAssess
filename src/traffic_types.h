@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -78,4 +79,37 @@ struct TrafficSnapshot {
     std::uint64_t received_bytes{};
     double sent_bytes_per_second{};
     double received_bytes_per_second{};
+};
+
+struct NetworkEndpoint {
+    IpAddress address;
+    std::uint16_t port{};
+    auto operator<=>(const NetworkEndpoint&) const = default;
+};
+
+struct ConnectionKey {
+    ProcessInstanceId process;
+    TransportProtocol transport{};
+    ApplicationProtocol application_protocol{};
+    NetworkEndpoint local;
+    NetworkEndpoint remote;
+    auto operator<=>(const ConnectionKey&) const = default;
+};
+
+struct ConnectionEvent {
+    ConnectionKey key;
+    std::wstring process_name;
+    TrafficDirection direction{};
+    std::uint64_t bytes{};
+    std::chrono::steady_clock::time_point observed_at;
+};
+
+struct ConnectionSnapshot {
+    ConnectionKey key;
+    std::wstring process_name;
+    std::uint64_t sent_bytes{};
+    std::uint64_t received_bytes{};
+    double sent_bytes_per_second{};
+    double received_bytes_per_second{};
+    std::chrono::steady_clock::time_point last_activity;
 };

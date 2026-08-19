@@ -1,0 +1,39 @@
+#pragma once
+
+#include "traffic_types.h"
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <mutex>
+#include <vector>
+
+class ConnectionAggregator {
+public:
+    explicit ConnectionAggregator(std::size_t max_entries = 100000);
+
+    void Add(const ConnectionEvent& event);
+    std::vector<ConnectionSnapshot> Snapshot(ProcessInstanceId process,
+                                             std::chrono::steady_clock::time_point now);
+    void ResetSnapshotBaseline(ProcessInstanceId process);
+    void Clear();
+    std::uint64_t dropped_detail_events() const;
+
+private:
+    struct Entry {
+        std::wstring process_name;
+        std::uint64_t sent_bytes{};
+        std::uint64_t received_bytes{};
+        std::uint64_t previous_sent_bytes{};
+        std::uint64_t previous_received_bytes{};
+        bool has_previous_snapshot{};
+        std::chrono::steady_clock::time_point last_activity;
+    };
+
+    const std::size_t max_entries_;
+    mutable std::mutex mutex_;
+    std::map<ConnectionKey, Entry> entries_;
+    std::map<ProcessInstanceId, std::chrono::steady_clock::time_point> previous_snapshot_times_;
+    std::uint64_t dropped_detail_events_{};
+};
