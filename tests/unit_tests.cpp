@@ -590,7 +590,11 @@ void TestConnectionAggregationUsesAllEndpointAndProtocolFields() {
         process, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls, 50000, 443,
         MakeIpv4Address(10, 0, 0, 2));
     const ConnectionKey different_transport = MakeConnectionKey(process, TransportProtocol::Udp,
-                                                                ApplicationProtocol::Quic, 50000, 443);
+                                                                ApplicationProtocol::HttpsTls, 50000, 443);
+    ConnectionKey different_remote_port = first;
+    different_remote_port.remote.port = 444;
+    ConnectionKey different_remote_address = first;
+    different_remote_address.remote.address = MakeIpv4Address(1, 1, 1, 1);
     const ConnectionKey different_application = MakeConnectionKey(process, TransportProtocol::Tcp,
                                                                   ApplicationProtocol::Http, 50000, 443);
     const ConnectionKey different_process = MakeConnectionKey({100, 2}, TransportProtocol::Tcp,
@@ -602,13 +606,15 @@ void TestConnectionAggregationUsesAllEndpointAndProtocolFields() {
     aggregator.Add({different_port, L"browser.exe", TrafficDirection::Send, 300, observed});
     aggregator.Add({different_address, L"browser.exe", TrafficDirection::Send, 400, observed});
     aggregator.Add({different_transport, L"browser.exe", TrafficDirection::Send, 500, observed});
+    aggregator.Add({different_remote_port, L"browser.exe", TrafficDirection::Send, 550, observed});
+    aggregator.Add({different_remote_address, L"browser.exe", TrafficDirection::Send, 575, observed});
     aggregator.Add({different_application, L"browser.exe", TrafficDirection::Send, 600, observed});
     aggregator.Add({different_process, L"other.exe", TrafficDirection::Send, 700, observed});
     aggregator.Add({first, L"renamed.exe", TrafficDirection::Send, 1,
                     observed + std::chrono::seconds(1)});
 
     const auto snapshots = aggregator.Snapshot(process, observed);
-    CHECK_EQ(snapshots.size(), 5U);
+    CHECK_EQ(snapshots.size(), 7U);
     CHECK_EQ(FindConnectionSnapshot(snapshots, first).sent_bytes, 101ULL);
     CHECK_EQ(FindConnectionSnapshot(snapshots, first).received_bytes, 200ULL);
     CHECK_EQ(FindConnectionSnapshot(snapshots, first).process_name, L"renamed.exe");
@@ -618,6 +624,8 @@ void TestConnectionAggregationUsesAllEndpointAndProtocolFields() {
     CHECK_EQ(FindConnectionSnapshot(snapshots, different_port).sent_bytes, 300ULL);
     CHECK_EQ(FindConnectionSnapshot(snapshots, different_address).sent_bytes, 400ULL);
     CHECK_EQ(FindConnectionSnapshot(snapshots, different_transport).sent_bytes, 500ULL);
+    CHECK_EQ(FindConnectionSnapshot(snapshots, different_remote_port).sent_bytes, 550ULL);
+    CHECK_EQ(FindConnectionSnapshot(snapshots, different_remote_address).sent_bytes, 575ULL);
     CHECK_EQ(FindConnectionSnapshot(snapshots, different_application).sent_bytes, 600ULL);
     CHECK_EQ(aggregator.Snapshot(different_process.process, observed).size(), 1U);
 }
@@ -729,6 +737,27 @@ void TestConnectionAggregationBoundsEntriesAndClearsState() {
                                     first)
                  .sent_bytes_per_second,
              0.0);
+}
+
+void TestConnectionClearResetsProcessSnapshotTimeBaseline() {
+    ConnectionAggregator aggregator;
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const auto key = MakeConnectionKey({105, 1}, TransportProtocol::Tcp,
+                                       ApplicationProtocol::HttpsTls, 50000, 443);
+
+    aggregator.Add({key, L"first.exe", TrafficDirection::Send, 10, t0});
+    aggregator.Snapshot(key.process, t0 + std::chrono::seconds(10));
+    aggregator.Clear();
+
+    aggregator.Add({key, L"first.exe", TrafficDirection::Send, 5, t0});
+    CHECK_EQ(FindConnectionSnapshot(aggregator.Snapshot(key.process, t0), key)
+                 .sent_bytes_per_second,
+             0.0);
+    aggregator.Add({key, L"first.exe", TrafficDirection::Send, 6, t0});
+    CHECK_EQ(FindConnectionSnapshot(aggregator.Snapshot(key.process, t0 + std::chrono::seconds(2)),
+                                    key)
+                 .sent_bytes_per_second,
+             3.0);
 }
 
 void TestConnectionAggregationDefaultCapacityIsOneHundredThousand() {
@@ -1904,6 +1933,7 @@ int main(int argc, char** argv) {
     TestConnectionAggregationSaturatesDirectionalCounters();
     TestConnectionSnapshotsKeepProcessBaselinesIndependent();
     TestConnectionAggregationBoundsEntriesAndClearsState();
+    TestConnectionClearResetsProcessSnapshotTimeBaseline();
     TestConnectionAggregationDefaultCapacityIsOneHundredThousand();
     TestEtwPayloadDecodeIsBoundedAndUsesNetworkOrderPorts();
     TestEtwPayloadDecodeCopiesIpv4EndpointAddresses();
