@@ -10,6 +10,7 @@
 std::wstring FormatBytes(std::uint64_t bytes);
 std::wstring FormatRate(double bytes_per_second);
 std::wstring_view ProcessStatusText(bool alive);
+std::wstring_view TransportProtocolName(TransportProtocol protocol);
 
 struct TrafficDisplayRow {
     TrafficSnapshot traffic;

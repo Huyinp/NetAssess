@@ -1,6 +1,7 @@
 #include "etw_decoder.h"
 #include "etw_monitor.h"
 #include "connection_aggregator.h"
+#include "connection_view.h"
 #include "formatting.h"
 #include "main_window.h"
 #include "process_info.h"
@@ -42,6 +43,18 @@ void PrintValue(std::ostream& stream, const T& value) {
 
 void PrintValue(std::ostream& stream, ApplicationProtocol value) {
     stream << static_cast<int>(value);
+}
+
+void PrintValue(std::ostream& stream, ConnectionActivityStatus value) {
+    stream << static_cast<int>(value);
+}
+
+void PrintValue(std::ostream& stream, ConnectionDirection value) {
+    stream << static_cast<int>(value);
+}
+
+void PrintValue(std::ostream& stream, const ConnectionKey& value) {
+    stream << value.process.pid;
 }
 
 void PrintValue(std::ostream& stream, std::wstring_view value) {
@@ -95,6 +108,15 @@ IpAddress MakeIpv4Address(std::uint8_t first, std::uint8_t second, std::uint8_t 
     address.bytes[1] = static_cast<std::byte>(second);
     address.bytes[2] = static_cast<std::byte>(third);
     address.bytes[3] = static_cast<std::byte>(fourth);
+    return address;
+}
+
+IpAddress MakeIpv6Address(std::initializer_list<std::uint8_t> bytes) {
+    IpAddress address{IpAddressFamily::V6, {}};
+    std::size_t index{};
+    for (const std::uint8_t value : bytes) {
+        address.bytes[index++] = static_cast<std::byte>(value);
+    }
     return address;
 }
 
@@ -1316,6 +1338,92 @@ void TestTrafficFormatting() {
     CHECK_EQ(ProcessStatusText(false), L"已结束");
 }
 
+void TestConnectionRowsFormatAddressesAndClassifyActivity() {
+    CHECK_EQ(FormatIpAddress(MakeIpv4Address(192, 0, 2, 1)), L"192.0.2.1");
+    CHECK_EQ(FormatIpAddress(MakeIpv6Address(
+                 {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})),
+             L"2001:db8::1");
+    CHECK_EQ(TransportProtocolName(TransportProtocol::Tcp), L"TCP");
+    CHECK_EQ(TransportProtocolName(TransportProtocol::Udp), L"UDP");
+
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    ConnectionSnapshot sent{MakeConnectionKey({1, 1}, TransportProtocol::Tcp,
+                                               ApplicationProtocol::Http, 50000, 80),
+                            L"browser.exe", 1, 0, 0, 0, t0};
+    ConnectionSnapshot received{MakeConnectionKey({1, 1}, TransportProtocol::Tcp,
+                                                   ApplicationProtocol::Http, 50001, 80),
+                                L"browser.exe", 0, 1, 0, 0, t0 - std::chrono::seconds(1)};
+    ConnectionSnapshot bidirectional{
+        MakeConnectionKey({1, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http, 50002, 80),
+        L"browser.exe", 1, 1, 0, 0, t0 - std::chrono::seconds(6)};
+
+    const auto rows = BuildConnectionRows({sent, received, bidirectional}, true,
+                                          t0 + std::chrono::seconds(5));
+    CHECK_EQ(rows.size(), 3ULL);
+    if (rows.size() == 3) {
+        CHECK_EQ(rows[0].direction, ConnectionDirection::SendOnly);
+        CHECK_EQ(rows[0].status, ConnectionActivityStatus::Active);
+        CHECK_EQ(rows[1].direction, ConnectionDirection::ReceiveOnly);
+        CHECK_EQ(rows[1].status, ConnectionActivityStatus::Historical);
+        CHECK_EQ(rows[2].direction, ConnectionDirection::Bidirectional);
+        CHECK_EQ(rows[2].status, ConnectionActivityStatus::Historical);
+    }
+
+    const auto ended = BuildConnectionRows({sent}, false, t0 + std::chrono::seconds(5));
+    CHECK_EQ(ended[0].status, ConnectionActivityStatus::ProcessEnded);
+    CHECK_EQ(ConnectionActivityStatusText(ConnectionActivityStatus::Active), L"活跃");
+    CHECK_EQ(ConnectionDirectionName(ConnectionDirection::Bidirectional), L"双向");
+}
+
+void TestConnectionRowsSortEveryColumnWithBinaryAndKeyTieBreakers() {
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    ConnectionSnapshot first{
+        MakeConnectionKey({20, 2}, TransportProtocol::Udp, ApplicationProtocol::Dns, 9000, 500,
+                          MakeIpv4Address(192, 0, 2, 1), MakeIpv4Address(10, 0, 0, 2)),
+        L"Alpha.exe", 100, 200, 1.0, 2.0, t0};
+    ConnectionSnapshot second{
+        MakeConnectionKey({10, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http, 1000, 443,
+                          MakeIpv4Address(2, 0, 0, 1), MakeIpv4Address(10, 0, 0, 1)),
+        L"alpha.exe", 200, 100, 2.0, 1.0, t0 - std::chrono::seconds(6)};
+    ConnectionSnapshot tied = first;
+    tied.key.process = {30, 3};
+
+    const auto rows = BuildConnectionRows({first, second, tied}, true, t0);
+    CHECK_EQ(rows[0].connection.key, second.key);
+    CHECK_EQ(rows[1].connection.key, first.key);
+    CHECK_EQ(rows[2].connection.key, tied.key);
+
+    auto sortable = rows;
+    sortable[0].status = ConnectionActivityStatus::Historical;
+    sortable[0].direction = ConnectionDirection::ReceiveOnly;
+    sortable[1].status = ConnectionActivityStatus::Active;
+    sortable[1].direction = ConnectionDirection::SendOnly;
+    sortable[2].status = ConnectionActivityStatus::Historical;
+    sortable[2].direction = ConnectionDirection::ReceiveOnly;
+    const auto expect_first = [&](ConnectionSortColumn column, const ConnectionKey& expected) {
+        auto sorted = sortable;
+        SortConnectionRows(sorted, column, true);
+        CHECK_EQ(sorted[0].connection.key, expected);
+    };
+    expect_first(ConnectionSortColumn::Status, first.key);
+    expect_first(ConnectionSortColumn::Direction, first.key);
+    expect_first(ConnectionSortColumn::Transport, second.key);
+    expect_first(ConnectionSortColumn::ApplicationProtocol, first.key);
+    expect_first(ConnectionSortColumn::LocalAddress, second.key);
+    expect_first(ConnectionSortColumn::LocalPort, second.key);
+    expect_first(ConnectionSortColumn::RemoteAddress, second.key);
+    expect_first(ConnectionSortColumn::RemotePort, second.key);
+    expect_first(ConnectionSortColumn::SentBytes, first.key);
+    expect_first(ConnectionSortColumn::SentRate, first.key);
+    expect_first(ConnectionSortColumn::ReceivedBytes, second.key);
+    expect_first(ConnectionSortColumn::ReceivedRate, second.key);
+
+    auto ties = BuildConnectionRows({tied, first}, true, t0);
+    SortConnectionRows(ties, ConnectionSortColumn::SentBytes, true);
+    CHECK_EQ(ties[0].connection.key, first.key);
+    CHECK_EQ(ties[1].connection.key, tied.key);
+}
+
 void TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically() {
     const TrafficKey slow{{300, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
     const TrafficKey fast{{200, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
@@ -2115,6 +2223,8 @@ int main(int argc, char** argv) {
     TestTrafficRatesClearAndSaturation();
     TestTrafficRatesIgnoreNonpositiveSnapshotTimes();
     TestTrafficAggregationKeepsApplicationProtocolsSeparate();
+    TestConnectionRowsFormatAddressesAndClassifyActivity();
+    TestConnectionRowsSortEveryColumnWithBinaryAndKeyTieBreakers();
     TestTrafficFormatting();
     TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically();
     TestVisibleRowsFilterWithoutMutatingSnapshotAndAttachLiveness();

@@ -91,10 +91,6 @@ SortColumn SortColumnForListColumn(int column) {
                : SortColumn::CombinedSpeed;
 }
 
-std::wstring TransportName(TransportProtocol protocol) {
-    return protocol == TransportProtocol::Tcp ? L"TCP" : L"UDP";
-}
-
 std::wstring SystemErrorText(ULONG error) {
     if (error == ERROR_SUCCESS) {
         return L"无";
@@ -459,7 +455,7 @@ private:
         SetItemText(index, 0, traffic.process_name);
         SetItemText(index, 1, std::to_wstring(traffic.key.process.pid));
         SetItemText(index, 2, ProcessStatusText(row.process_alive));
-        SetItemText(index, 3, TransportName(traffic.key.transport));
+        SetItemText(index, 3, std::wstring{TransportProtocolName(traffic.key.transport)});
         SetItemText(index, 4, ApplicationProtocolName(traffic.key.application_protocol));
         SetItemText(index, 5, FormatBytes(traffic.sent_bytes));
         SetItemText(index, 6, FormatRate(traffic.sent_bytes_per_second));

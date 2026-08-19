@@ -101,6 +101,10 @@ std::wstring_view ProcessStatusText(bool alive) {
     return alive ? L"运行中" : L"已结束";
 }
 
+std::wstring_view TransportProtocolName(TransportProtocol protocol) {
+    return protocol == TransportProtocol::Tcp ? L"TCP" : L"UDP";
+}
+
 void SortTrafficRows(std::vector<TrafficDisplayRow>& rows, SortColumn column, bool ascending) {
     std::stable_sort(rows.begin(), rows.end(), [column, ascending](const TrafficDisplayRow& left,
                                                                     const TrafficDisplayRow& right) {

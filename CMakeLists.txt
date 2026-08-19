@@ -25,12 +25,13 @@ endif()
 
 add_library(NetAssessCore STATIC src/protocol_classifier.cpp src/traffic_aggregator.cpp
                                   src/connection_aggregator.cpp src/formatting.cpp
+                                  src/connection_view.cpp
                                   src/process_info.cpp src/etw_decoder.cpp src/etw_monitor.cpp
                                   src/main_window.cpp)
 target_include_directories(NetAssessCore PUBLIC src)
 target_compile_definitions(NetAssessCore PUBLIC _WIN32_WINNT=0x0A00 UNICODE _UNICODE)
 target_compile_options(NetAssessCore PRIVATE /utf-8)
-target_link_libraries(NetAssessCore PRIVATE tdh advapi32 ole32 comctl32 user32 gdi32)
+target_link_libraries(NetAssessCore PRIVATE tdh advapi32 ole32 comctl32 user32 gdi32 ws2_32)
 
 add_executable(NetAssess WIN32 src/main.cpp resources/app.manifest)
 target_link_libraries(NetAssess PRIVATE NetAssessCore)
