@@ -445,6 +445,20 @@ DWORD RunEtwMonitorStopInterleavingProcess() {
         }                                                                            \
     } while (false)
 
+EventLayout MakeIpv4Layout(TrafficDirection direction, TransportProtocol transport) {
+    EventLayout layout{};
+    layout.pid = {0, 4};
+    layout.size = {4, 4};
+    layout.source_address = {8, 4};
+    layout.destination_address = {12, 4};
+    layout.source_port = {16, 2};
+    layout.destination_port = {18, 2};
+    layout.direction = direction;
+    layout.transport = transport;
+    layout.address_family = IpAddressFamily::V4;
+    return layout;
+}
+
 void TestTrafficAggregationKeepsDistinctKeysAndDirectionsSeparate() {
     TrafficAggregator aggregator;
     const auto t0 = std::chrono::steady_clock::time_point{};
@@ -475,11 +489,12 @@ void TestTrafficAggregationKeepsDistinctKeysAndDirectionsSeparate() {
 }
 
 void TestEtwPayloadDecodeIsBoundedAndUsesNetworkOrderPorts() {
-    const EventLayout layout{{0, 4}, {4, 4}, {8, 2}, {10, 2},
-                             TrafficDirection::Send, TransportProtocol::Tcp};
+    const EventLayout layout = MakeIpv4Layout(TrafficDirection::Send, TransportProtocol::Tcp);
     const std::array payload{
         std::byte{0x78}, std::byte{0x56}, std::byte{0x34}, std::byte{0x12},
         std::byte{0x04}, std::byte{0x03}, std::byte{0x02}, std::byte{0x01},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
         std::byte{0x12}, std::byte{0x34}, std::byte{0xAB}, std::byte{0xCD},
     };
 
@@ -511,12 +526,120 @@ void TestEtwPayloadDecodeIsBoundedAndUsesNetworkOrderPorts() {
     CHECK_EQ(DecodePayload(overflowing_offset, payload).has_value(), false);
 }
 
+void TestEtwPayloadDecodeCopiesIpv4EndpointAddresses() {
+    EventLayout ipv4{};
+    ipv4.pid = {0, 4};
+    ipv4.size = {4, 4};
+    ipv4.source_address = {8, 4};
+    ipv4.destination_address = {12, 4};
+    ipv4.source_port = {16, 2};
+    ipv4.destination_port = {18, 2};
+    ipv4.direction = TrafficDirection::Send;
+    ipv4.transport = TransportProtocol::Tcp;
+    ipv4.address_family = IpAddressFamily::V4;
+
+    const std::array payload{
+        std::byte{0x78}, std::byte{0x56}, std::byte{0x34}, std::byte{0x12},
+        std::byte{0x04}, std::byte{0x03}, std::byte{0x02}, std::byte{0x01},
+        std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1},
+        std::byte{198}, std::byte{51}, std::byte{100}, std::byte{2},
+        std::byte{0x12}, std::byte{0x34}, std::byte{0xAB}, std::byte{0xCD},
+    };
+    const std::array<std::byte, 16> expected_source{
+        std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1}};
+    const std::array<std::byte, 16> expected_destination{
+        std::byte{198}, std::byte{51}, std::byte{100}, std::byte{2}};
+
+    const auto decoded = DecodePayload(ipv4, payload);
+    CHECK_EQ(decoded.has_value(), true);
+    if (decoded) {
+        CHECK_EQ(decoded->pid, 0x12345678U);
+        CHECK_EQ(decoded->bytes, 0x01020304ULL);
+        CHECK_EQ(static_cast<int>(decoded->direction), static_cast<int>(TrafficDirection::Send));
+        CHECK_EQ(static_cast<int>(decoded->transport), static_cast<int>(TransportProtocol::Tcp));
+        CHECK_EQ(static_cast<int>(decoded->source_address.family), static_cast<int>(IpAddressFamily::V4));
+        CHECK_EQ(static_cast<int>(decoded->destination_address.family), static_cast<int>(IpAddressFamily::V4));
+        CHECK_EQ(decoded->source_port, 0x1234U);
+        CHECK_EQ(decoded->destination_port, 0xABCDU);
+        for (std::size_t index = 0; index < expected_source.size(); ++index) {
+            CHECK_EQ(std::to_integer<int>(decoded->source_address.bytes[index]),
+                     std::to_integer<int>(expected_source[index]));
+            CHECK_EQ(std::to_integer<int>(decoded->destination_address.bytes[index]),
+                     std::to_integer<int>(expected_destination[index]));
+        }
+    }
+}
+
+void TestEtwPayloadDecodeCopiesIpv6EndpointAddresses() {
+    EventLayout ipv6{};
+    ipv6.pid = {0, 4};
+    ipv6.size = {4, 4};
+    ipv6.source_address = {8, 16};
+    ipv6.destination_address = {24, 16};
+    ipv6.source_port = {40, 2};
+    ipv6.destination_port = {42, 2};
+    ipv6.direction = TrafficDirection::Receive;
+    ipv6.transport = TransportProtocol::Udp;
+    ipv6.address_family = IpAddressFamily::V6;
+
+    const std::array payload{
+        std::byte{0x2A}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0x40}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0x20}, std::byte{0x01}, std::byte{0x0D}, std::byte{0xB8},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1},
+        std::byte{0x20}, std::byte{0x01}, std::byte{0x0D}, std::byte{0xB8},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{2},
+        std::byte{0}, std::byte{0x35}, std::byte{0xC0}, std::byte{0},
+    };
+    const std::array<std::byte, 16> expected_source{
+        std::byte{0x20}, std::byte{0x01}, std::byte{0x0D}, std::byte{0xB8},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}};
+    const std::array<std::byte, 16> expected_destination{
+        std::byte{0x20}, std::byte{0x01}, std::byte{0x0D}, std::byte{0xB8},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{2}};
+
+    const auto decoded = DecodePayload(ipv6, payload);
+    CHECK_EQ(decoded.has_value(), true);
+    if (decoded) {
+        CHECK_EQ(decoded->pid, 42U);
+        CHECK_EQ(decoded->bytes, 64ULL);
+        CHECK_EQ(static_cast<int>(decoded->direction), static_cast<int>(TrafficDirection::Receive));
+        CHECK_EQ(static_cast<int>(decoded->transport), static_cast<int>(TransportProtocol::Udp));
+        CHECK_EQ(static_cast<int>(decoded->source_address.family), static_cast<int>(IpAddressFamily::V6));
+        CHECK_EQ(static_cast<int>(decoded->destination_address.family), static_cast<int>(IpAddressFamily::V6));
+        CHECK_EQ(decoded->source_port, 53U);
+        CHECK_EQ(decoded->destination_port, 49152U);
+        for (std::size_t index = 0; index < expected_source.size(); ++index) {
+            CHECK_EQ(std::to_integer<int>(decoded->source_address.bytes[index]),
+                     std::to_integer<int>(expected_source[index]));
+            CHECK_EQ(std::to_integer<int>(decoded->destination_address.bytes[index]),
+                     std::to_integer<int>(expected_destination[index]));
+        }
+    }
+
+    CHECK_EQ(DecodePayload(ipv6, std::span{payload}.first(39)).has_value(), false);
+
+    auto wrong_width = ipv6;
+    wrong_width.source_address.width = 4;
+    const auto wrong_width_payload = payload;
+    CHECK_EQ(DecodePayload(wrong_width, wrong_width_payload).has_value(), false);
+}
+
 void TestEtwDecoderCachesLayoutsBySchemaKey() {
-    const EventLayout layout{{0, 4}, {4, 4}, {8, 2}, {10, 2},
-                             TrafficDirection::Receive, TransportProtocol::Udp};
+    const EventLayout layout = MakeIpv4Layout(TrafficDirection::Receive, TransportProtocol::Udp);
     const std::array payload{
         std::byte{0x2A}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
         std::byte{0x40}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+        std::byte{127}, std::byte{0}, std::byte{0}, std::byte{1},
+        std::byte{127}, std::byte{0}, std::byte{0}, std::byte{1},
         std::byte{0x00}, std::byte{0x35}, std::byte{0xC0}, std::byte{0x00},
     };
     int load_count = 0;
@@ -534,7 +657,16 @@ void TestEtwDecoderCachesLayoutsBySchemaKey() {
     record.UserData = const_cast<std::byte*>(payload.data());
     record.UserDataLength = static_cast<USHORT>(payload.size());
 
-    CHECK_EQ(decoder.Decode(record).has_value(), true);
+    const auto first_decoded = decoder.Decode(record);
+    CHECK_EQ(first_decoded.has_value(), true);
+    if (first_decoded) {
+        CHECK_EQ(static_cast<int>(first_decoded->source_address.family),
+                 static_cast<int>(IpAddressFamily::V4));
+        CHECK_EQ(static_cast<int>(first_decoded->destination_address.family),
+                 static_cast<int>(IpAddressFamily::V4));
+        CHECK_EQ(std::to_integer<int>(first_decoded->source_address.bytes[0]), 127);
+        CHECK_EQ(std::to_integer<int>(first_decoded->destination_address.bytes[0]), 127);
+    }
     CHECK_EQ(decoder.Decode(record).has_value(), true);
     CHECK_EQ(load_count, 1);
     CHECK_EQ(decoder.cached_layout_count(), 1U);
@@ -549,6 +681,36 @@ void TestEtwDecoderCachesLayoutsBySchemaKey() {
     CHECK_EQ(decoder.Decode(record).has_value(), true);
     CHECK_EQ(load_count, 3);
     CHECK_EQ(decoder.cached_layout_count(), 3U);
+}
+
+void TestEtwDecoderCachesAddressWidthFailuresAndCountsEveryFailedEvent() {
+    EventLayout layout = MakeIpv4Layout(TrafficDirection::Send, TransportProtocol::Tcp);
+    layout.source_address.width = 16;
+    const std::array payload{
+        std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{127}, std::byte{0}, std::byte{0}, std::byte{1},
+        std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1},
+        std::byte{0}, std::byte{80}, std::byte{0x01}, std::byte{0xBB},
+    };
+    int load_count = 0;
+    EtwDecoder decoder([&](const EVENT_RECORD&) -> std::optional<EventLayout> {
+        ++load_count;
+        return layout;
+    });
+    EVENT_RECORD record{};
+    record.EventHeader.ProviderId =
+        GUID{0x9a280ac0, 0xc8e0, 0x11d1, {0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2}};
+    record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_SEND;
+    record.EventHeader.Flags = EVENT_HEADER_FLAG_64_BIT_HEADER;
+    record.UserData = const_cast<std::byte*>(payload.data());
+    record.UserDataLength = static_cast<USHORT>(payload.size());
+
+    CHECK_EQ(decoder.Decode(record).has_value(), false);
+    CHECK_EQ(decoder.Decode(record).has_value(), false);
+    CHECK_EQ(load_count, 1);
+    CHECK_EQ(decoder.cached_layout_count(), 1U);
+    CHECK_EQ(decoder.parse_failures(), 2ULL);
 }
 
 void TestEtwDecoderCachesInvalidLayoutsAndCountsEveryFailedEvent() {
@@ -599,11 +761,12 @@ void TestEtwDecoderIgnoresNonNetworkAndNonDataEvents() {
 }
 
 void TestSyntheticRecordFlowsThroughDecodeResolveClassifyAndAggregate() {
-    const EventLayout layout{{0, 4}, {4, 4}, {8, 2}, {10, 2},
-                             TrafficDirection::Send, TransportProtocol::Tcp};
+    const EventLayout layout = MakeIpv4Layout(TrafficDirection::Send, TransportProtocol::Tcp);
     const std::array payload{
         std::byte{0xD2}, std::byte{0x04}, std::byte{0x00}, std::byte{0x00},
         std::byte{0x00}, std::byte{0x08}, std::byte{0x00}, std::byte{0x00},
+        std::byte{127}, std::byte{0}, std::byte{0}, std::byte{1},
+        std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1},
         std::byte{0xC3}, std::byte{0x50}, std::byte{0x01}, std::byte{0xBB},
     };
     EtwDecoder decoder([&](const EVENT_RECORD&) -> std::optional<EventLayout> {
@@ -1354,7 +1517,10 @@ int main(int argc, char** argv) {
 
     TestTrafficAggregationKeepsDistinctKeysAndDirectionsSeparate();
     TestEtwPayloadDecodeIsBoundedAndUsesNetworkOrderPorts();
+    TestEtwPayloadDecodeCopiesIpv4EndpointAddresses();
+    TestEtwPayloadDecodeCopiesIpv6EndpointAddresses();
     TestEtwDecoderCachesLayoutsBySchemaKey();
+    TestEtwDecoderCachesAddressWidthFailuresAndCountsEveryFailedEvent();
     TestEtwDecoderCachesInvalidLayoutsAndCountsEveryFailedEvent();
     TestEtwDecoderIgnoresNonNetworkAndNonDataEvents();
     TestSyntheticRecordFlowsThroughDecodeResolveClassifyAndAggregate();

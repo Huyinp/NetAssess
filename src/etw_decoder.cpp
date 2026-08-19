@@ -48,6 +48,11 @@ std::optional<std::pair<TrafficDirection, TransportProtocol>> Classify(
     }
 }
 
+IpAddressFamily AddressFamilyForOpcode(std::uint8_t opcode) {
+    return opcode == kSendIpv6 || opcode == kReceiveIpv6 ? IpAddressFamily::V6
+                                                         : IpAddressFamily::V4;
+}
+
 std::optional<std::size_t> FixedElementWidth(const EVENT_PROPERTY_INFO& property,
                                              std::uint16_t header_flags) {
     if ((property.Flags & (PropertyStruct | PropertyParamLength | PropertyParamCount |
@@ -165,6 +170,7 @@ std::optional<EventLayout> LoadEventLayout(const EVENT_RECORD& record) {
     EventLayout layout;
     layout.direction = classification->first;
     layout.transport = classification->second;
+    layout.address_family = AddressFamilyForOpcode(record.EventHeader.EventDescriptor.Opcode);
     std::size_t offset = 0;
     const std::uint16_t header_flags = record.EventHeader.Flags &
                                        (EVENT_HEADER_FLAG_32_BIT_HEADER |
@@ -182,6 +188,10 @@ std::optional<EventLayout> LoadEventLayout(const EVENT_RECORD& record) {
             accepted = SetField(layout.pid, offset, *width);
         } else if (_wcsicmp(name, L"size") == 0) {
             accepted = SetField(layout.size, offset, *width);
+        } else if (_wcsicmp(name, L"saddr") == 0) {
+            accepted = SetField(layout.source_address, offset, *width);
+        } else if (_wcsicmp(name, L"daddr") == 0) {
+            accepted = SetField(layout.destination_address, offset, *width);
         } else if (_wcsicmp(name, L"sport") == 0) {
             accepted = SetField(layout.source_port, offset, *width);
         } else if (_wcsicmp(name, L"dport") == 0) {
@@ -193,7 +203,10 @@ std::optional<EventLayout> LoadEventLayout(const EVENT_RECORD& record) {
         offset += *width;
     }
 
-    if (layout.pid.width != 4 || layout.size.width != 4 || layout.source_port.width != 2 ||
+    const std::size_t address_width = layout.address_family == IpAddressFamily::V4 ? 4 : 16;
+    if (layout.pid.width != 4 || layout.size.width != 4 ||
+        layout.source_address.width != address_width ||
+        layout.destination_address.width != address_width || layout.source_port.width != 2 ||
         layout.destination_port.width != 2) {
         return std::nullopt;
     }
@@ -228,6 +241,19 @@ std::optional<std::uint16_t> ReadNetworkOrder16(std::span<const std::byte> paylo
         std::to_integer<std::uint16_t>(payload[field.offset + 1]));
 }
 
+std::optional<IpAddress> ReadAddress(std::span<const std::byte> payload,
+                                     const FieldLayout& field, IpAddressFamily family) {
+    const std::size_t address_width = family == IpAddressFamily::V4 ? 4 : 16;
+    if (field.width != address_width || !Contains(payload, field)) {
+        return std::nullopt;
+    }
+
+    IpAddress address{};
+    address.family = family;
+    std::copy_n(payload.begin() + field.offset, field.width, address.bytes.begin());
+    return address;
+}
+
 }  // namespace
 
 std::optional<DecodedNetworkEvent> DecodePayload(const EventLayout& layout,
@@ -238,14 +264,19 @@ std::optional<DecodedNetworkEvent> DecodePayload(const EventLayout& layout,
 
     const auto pid = ReadLittleEndian32(payload, layout.pid);
     const auto size = ReadLittleEndian32(payload, layout.size);
+    const auto source_address =
+        ReadAddress(payload, layout.source_address, layout.address_family);
+    const auto destination_address =
+        ReadAddress(payload, layout.destination_address, layout.address_family);
     const auto source_port = ReadNetworkOrder16(payload, layout.source_port);
     const auto destination_port = ReadNetworkOrder16(payload, layout.destination_port);
-    if (!pid || !size || !source_port || !destination_port) {
+    if (!pid || !size || !source_address || !destination_address || !source_port ||
+        !destination_port) {
         return std::nullopt;
     }
 
-    return DecodedNetworkEvent{*pid, layout.direction, layout.transport, *source_port,
-                               *destination_port, *size};
+    return DecodedNetworkEvent{*pid, layout.direction, layout.transport, *source_address,
+                               *destination_address, *source_port, *destination_port, *size};
 }
 
 bool EtwDecoder::SchemaKeyLess::operator()(const SchemaKey& left,

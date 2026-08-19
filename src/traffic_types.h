@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <compare>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -12,6 +14,17 @@ enum class TransportProtocol {
 enum class TrafficDirection {
     Send,
     Receive,
+};
+
+enum class IpAddressFamily {
+    V4,
+    V6,
+};
+
+struct IpAddress {
+    IpAddressFamily family;
+    std::array<std::byte, 16> bytes;
+    auto operator<=>(const IpAddress&) const = default;
 };
 
 enum class ApplicationProtocol {

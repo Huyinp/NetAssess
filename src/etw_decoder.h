@@ -25,16 +25,21 @@ struct FieldLayout {
 struct EventLayout {
     FieldLayout pid;
     FieldLayout size;
+    FieldLayout source_address;
+    FieldLayout destination_address;
     FieldLayout source_port;
     FieldLayout destination_port;
     TrafficDirection direction{};
     TransportProtocol transport{};
+    IpAddressFamily address_family{};
 };
 
 struct DecodedNetworkEvent {
     std::uint32_t pid{};
     TrafficDirection direction{};
     TransportProtocol transport{};
+    IpAddress source_address{};
+    IpAddress destination_address{};
     std::uint16_t source_port{};
     std::uint16_t destination_port{};
     std::uint64_t bytes{};
