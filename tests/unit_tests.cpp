@@ -1087,41 +1087,44 @@ void TestEtwMonitorDoesNotReportSuccessfulPendingStopCodesAsErrors() {
 }
 
 void TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop() {
-    TrafficAggregator aggregator;
-    ProcessInfoCache process_cache;
-    FakeEtwSessionApi api;
-    api.block_query = true;
-    api.query_events_lost = std::numeric_limits<ULONG>::max();
-    api.query_real_time_buffers_lost = std::numeric_limits<ULONG>::max();
-    EtwMonitor monitor(aggregator, process_cache, api);
+    for (int iteration = 0; iteration < 100; ++iteration) {
+        TrafficAggregator aggregator;
+        ProcessInfoCache process_cache;
+        FakeEtwSessionApi api;
+        api.block_query = true;
+        api.query_events_lost = std::numeric_limits<ULONG>::max();
+        api.query_real_time_buffers_lost = 17;
+        EtwMonitor monitor(aggregator, process_cache, api);
 
-    CHECK_EQ(monitor.Start(), true);
-    CHECK_EQ(api.WaitForConsumers(), true);
+        CHECK_EQ(monitor.Start(), true);
+        CHECK_EQ(api.WaitForConsumers(), true);
 
-    std::uint64_t loss_count = 0;
-    std::jthread query_thread([&] { loss_count = monitor.events_lost(); });
-    CHECK_EQ(api.WaitForQuery(), true);
+        EtwLossCounters observed{};
+        std::jthread query_thread([&] { observed = monitor.loss_counters(); });
+        CHECK_EQ(api.WaitForQuery(), true);
 
-    std::atomic_bool stop_returned{};
-    std::jthread stop_thread([&] {
-        monitor.Stop();
-        stop_returned.store(true, std::memory_order_release);
-    });
-    CHECK_EQ(api.WaitForCloseFor(std::chrono::milliseconds(100)), false);
-    CHECK_EQ(api.StopCallCount(), 0);
-    CHECK_EQ(stop_returned.load(std::memory_order_acquire), false);
+        std::atomic_bool stop_returned{};
+        std::jthread stop_thread([&] {
+            monitor.Stop();
+            stop_returned.store(true, std::memory_order_release);
+        });
+        CHECK_EQ(api.WaitForCloseFor(std::chrono::milliseconds(100)), false);
+        CHECK_EQ(api.StopCallCount(), 0);
+        CHECK_EQ(stop_returned.load(std::memory_order_acquire), false);
 
-    api.ReleaseQuery();
-    query_thread.join();
-    stop_thread.join();
+        api.ReleaseQuery();
+        query_thread.join();
+        stop_thread.join();
 
-    CHECK_EQ(stop_returned.load(std::memory_order_acquire), true);
-    CHECK_EQ(loss_count, 4294967295ULL);
-    CHECK_EQ(api.control_query_calls, 1);
-    CHECK_EQ(api.queried_session_handle, api.session_handle_to_return);
-    CHECK_EQ(api.queried_name, api.started_name);
-    CHECK_EQ(api.control_stop_calls, 1);
-    CHECK_EQ(api.close_trace_calls, 1);
+        CHECK_EQ(stop_returned.load(std::memory_order_acquire), true);
+        CHECK_EQ(observed.events_lost, 4294967295ULL);
+        CHECK_EQ(observed.real_time_buffers_lost, 17ULL);
+        CHECK_EQ(api.control_query_calls, 1);
+        CHECK_EQ(api.queried_session_handle, api.session_handle_to_return);
+        CHECK_EQ(api.queried_name, api.started_name);
+        CHECK_EQ(api.control_stop_calls, 1);
+        CHECK_EQ(api.close_trace_calls, 1);
+    }
 }
 
 void TestEtwMonitorExposesRealTimeBufferLossSeparately() {

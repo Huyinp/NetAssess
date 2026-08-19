@@ -33,6 +33,11 @@ public:
                                 EVENT_TRACE_PROPERTIES* properties, ULONG control_code) = 0;
 };
 
+struct EtwLossCounters {
+    std::uint64_t events_lost;
+    std::uint64_t real_time_buffers_lost;
+};
+
 class EtwMonitor {
 public:
     EtwMonitor(TrafficAggregator& aggregator, ProcessInfoCache& process_cache);
@@ -50,6 +55,7 @@ public:
     void Stop();
 
     bool running() const noexcept;
+    EtwLossCounters loss_counters() const;
     std::uint64_t events_lost() const;
     std::uint64_t real_time_buffers_lost() const;
     std::uint64_t parse_failures() const noexcept;
@@ -65,7 +71,6 @@ private:
     void CloseOwnedResources();
     void FinalizeStoppedSession();
     void SetLastErrorIfEmpty(ULONG error) const noexcept;
-    void RefreshLossCounters() const;
     void StoreLossCounters(const EVENT_TRACE_PROPERTIES& properties) const noexcept;
     EVENT_TRACE_PROPERTIES* properties() noexcept;
 

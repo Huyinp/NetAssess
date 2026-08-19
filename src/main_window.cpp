@@ -513,12 +513,13 @@ private:
             return;
         }
         const bool running = monitor_.running();
+        const EtwLossCounters loss_counters = monitor_.loss_counters();
         SetWindowTextW(start_stop_button_, running ? L"停止采集" : L"开始采集");
         const std::wstring status =
             std::wstring(L"采集状态：") + (running ? L"运行中" : L"已停止") +
-            L"  |  事件丢失：" + std::to_wstring(monitor_.events_lost()) +
+            L"  |  事件丢失：" + std::to_wstring(loss_counters.events_lost) +
             L"  |  实时缓冲区丢失：" +
-                std::to_wstring(monitor_.real_time_buffers_lost()) +
+                std::to_wstring(loss_counters.real_time_buffers_lost) +
             L"  |  解析失败：" + std::to_wstring(monitor_.parse_failures()) +
             L"  |  最近错误：" + SystemErrorText(monitor_.last_error());
         SendMessageW(status_bar_, SB_SETTEXTW, 0,

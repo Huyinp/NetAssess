@@ -184,25 +184,17 @@ bool EtwMonitor::running() const noexcept {
     return running_.load(std::memory_order_acquire);
 }
 
-std::uint64_t EtwMonitor::events_lost() const {
-    RefreshLossCounters();
-    return events_lost_.load(std::memory_order_relaxed);
-}
-
-std::uint64_t EtwMonitor::real_time_buffers_lost() const {
-    RefreshLossCounters();
-    return real_time_buffers_lost_.load(std::memory_order_relaxed);
-}
-
-void EtwMonitor::RefreshLossCounters() const {
+EtwLossCounters EtwMonitor::loss_counters() const {
     std::lock_guard transition_lock(transition_mutex_);
     if (session_handle_ == 0 || cleanup_started_.load(std::memory_order_acquire)) {
-        return;
+        return {events_lost_.load(std::memory_order_relaxed),
+                real_time_buffers_lost_.load(std::memory_order_relaxed)};
     }
 
     std::lock_guard api_lock(api_mutex_);
     if (cleanup_started_.load(std::memory_order_acquire)) {
-        return;
+        return {events_lost_.load(std::memory_order_relaxed),
+                real_time_buffers_lost_.load(std::memory_order_relaxed)};
     }
 
     auto query_buffer = properties_buffer_;
@@ -212,10 +204,21 @@ void EtwMonitor::RefreshLossCounters() const {
         session_handle_, session_name_.c_str(), query_properties, EVENT_TRACE_CONTROL_QUERY);
     if (result != ERROR_SUCCESS) {
         SetLastErrorIfEmpty(result);
-        return;
+        return {events_lost_.load(std::memory_order_relaxed),
+                real_time_buffers_lost_.load(std::memory_order_relaxed)};
     }
 
     StoreLossCounters(*query_properties);
+    return {static_cast<std::uint64_t>(query_properties->EventsLost),
+            static_cast<std::uint64_t>(query_properties->RealTimeBuffersLost)};
+}
+
+std::uint64_t EtwMonitor::events_lost() const {
+    return loss_counters().events_lost;
+}
+
+std::uint64_t EtwMonitor::real_time_buffers_lost() const {
+    return loss_counters().real_time_buffers_lost;
 }
 
 std::uint64_t EtwMonitor::parse_failures() const noexcept {
