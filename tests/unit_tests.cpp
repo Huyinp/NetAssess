@@ -1582,6 +1582,45 @@ void TestProcessForVisibleRowReturnsProcessInstanceIdentity() {
     CHECK_EQ(ProcessForVisibleRow(current_keys, 3).has_value(), false);
 }
 
+void TestConnectionWindowRegistryErasesOnlyMatchingHandle() {
+    const ProcessInstanceId first_process{501, 77};
+    const ProcessInstanceId second_process{502, 88};
+    const HWND first_window =
+        reinterpret_cast<HWND>(static_cast<std::uintptr_t>(0x101));
+    const HWND second_window =
+        reinterpret_cast<HWND>(static_cast<std::uintptr_t>(0x202));
+    const HWND unrelated_window =
+        reinterpret_cast<HWND>(static_cast<std::uintptr_t>(0x303));
+    std::map<ProcessInstanceId, HWND> registry{
+        {first_process, first_window},
+        {second_process, second_window},
+    };
+
+    CHECK_EQ(EraseConnectionWindowIfMatches(registry, unrelated_window), false);
+    CHECK_EQ(registry.size(), 2U);
+    CHECK_EQ(EraseConnectionWindowIfMatches(registry, first_window), true);
+    CHECK_EQ(registry.size(), 1U);
+    CHECK_EQ(registry.contains(first_process), false);
+    CHECK_EQ(registry.contains(second_process), true);
+    if (registry.contains(second_process)) {
+        CHECK_EQ(registry.at(second_process), second_window);
+    }
+}
+
+void TestTakeConnectionWindowsMakesDestroyCallbacksSafe() {
+    const ProcessInstanceId process{503, 99};
+    const HWND window =
+        reinterpret_cast<HWND>(static_cast<std::uintptr_t>(0x404));
+    std::map<ProcessInstanceId, HWND> registry{{process, window}};
+
+    const auto windows_to_destroy = TakeConnectionWindows(registry);
+    CHECK_EQ(registry.empty(), true);
+    CHECK_EQ(windows_to_destroy.size(), 1U);
+    CHECK_EQ(EraseConnectionWindowIfMatches(registry, window), false);
+    CHECK_EQ(registry.empty(), true);
+    CHECK_EQ(windows_to_destroy.at(process), window);
+}
+
 void TestProcessInfoResolvesLiveAndInaccessibleProcesses() {
     ProcessInfoCache cache;
 
@@ -2261,6 +2300,8 @@ int main(int argc, char** argv) {
     TestVisibleRowsDefaultOrderUsesCombinedSpeedDescending();
     TestVisibleRowsUsesInvariantUnicodeCaseInsensitiveFilter();
     TestProcessForVisibleRowReturnsProcessInstanceIdentity();
+    TestConnectionWindowRegistryErasesOnlyMatchingHandle();
+    TestTakeConnectionWindowsMakesDestroyCallbacksSafe();
     TestProcessInfoResolvesLiveAndInaccessibleProcesses();
     TestProcessInfoFallbackDoesNotMaskRealIdentityOrPidReuse();
     TestProcessInfoCacheUsesCreationTimeOnRealCacheHits();

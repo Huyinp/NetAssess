@@ -161,6 +161,10 @@ private:
             UpdateStatus();
             return started ? TRUE : FALSE;
         }
+        case kConnectionWindowClosedMessage:
+            EraseConnectionWindowIfMatches(
+                connection_windows_, reinterpret_cast<HWND>(wparam));
+            return 0;
         case WM_DESTROY:
             DestroyConnectionWindows();
             if (refresh_timer_ != 0) {
@@ -580,12 +584,12 @@ private:
     }
 
     void DestroyConnectionWindows() {
-        for (const auto& entry : connection_windows_) {
+        const auto windows_to_destroy = TakeConnectionWindows(connection_windows_);
+        for (const auto& entry : windows_to_destroy) {
             if (IsWindow(entry.second)) {
                 DestroyWindow(entry.second);
             }
         }
-        connection_windows_.clear();
     }
 
     void UpdateStatus() const {
@@ -667,6 +671,25 @@ std::optional<ProcessInstanceId> ProcessForVisibleRow(
         return std::nullopt;
     }
     return current_keys[static_cast<std::size_t>(row)].process;
+}
+
+bool EraseConnectionWindowIfMatches(
+    std::map<ProcessInstanceId, HWND>& registry, HWND window) {
+    const auto match = std::find_if(
+        registry.begin(), registry.end(),
+        [window](const auto& entry) { return entry.second == window; });
+    if (match == registry.end()) {
+        return false;
+    }
+    registry.erase(match);
+    return true;
+}
+
+std::map<ProcessInstanceId, HWND> TakeConnectionWindows(
+    std::map<ProcessInstanceId, HWND>& registry) {
+    std::map<ProcessInstanceId, HWND> windows;
+    windows.swap(registry);
+    return windows;
 }
 
 HWND CreateMainWindow(HINSTANCE instance, TrafficAggregator& aggregator,

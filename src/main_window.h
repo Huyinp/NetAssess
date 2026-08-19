@@ -3,6 +3,7 @@
 #include "formatting.h"
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -27,6 +28,10 @@ std::vector<TrafficDisplayRow> BuildVisibleRows(
     const std::function<bool(ProcessInstanceId)>& alive_lookup);
 std::optional<ProcessInstanceId> ProcessForVisibleRow(
     std::span<const TrafficKey> current_keys, int row);
+bool EraseConnectionWindowIfMatches(
+    std::map<ProcessInstanceId, HWND>& registry, HWND window);
+std::map<ProcessInstanceId, HWND> TakeConnectionWindows(
+    std::map<ProcessInstanceId, HWND>& registry);
 
 HWND CreateMainWindow(HINSTANCE instance, TrafficAggregator& aggregator,
                       ConnectionAggregator& connection_aggregator,

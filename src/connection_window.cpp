@@ -44,9 +44,11 @@ ConnectionSortColumn SortColumnForListColumn(int column) {
 
 class ConnectionWindow {
 public:
-    ConnectionWindow(ProcessInstanceId process, ConnectionAggregator& aggregator,
+    ConnectionWindow(HWND owner, ProcessInstanceId process,
+                     ConnectionAggregator& aggregator,
                      ProcessInfoCache& process_cache)
-        : process_(process),
+        : owner_(owner),
+          process_(process),
           aggregator_(aggregator),
           process_cache_(process_cache) {}
 
@@ -62,6 +64,11 @@ public:
             self->window_ = window;
             SetWindowLongPtrW(window, GWLP_USERDATA,
                               reinterpret_cast<LONG_PTR>(self));
+        }
+
+        if (message == WM_NCDESTROY && self != nullptr && self->owner_ != nullptr) {
+            SendMessageW(self->owner_, kConnectionWindowClosedMessage,
+                         reinterpret_cast<WPARAM>(window), 0);
         }
 
         const LRESULT result = self == nullptr
@@ -351,6 +358,7 @@ private:
         }
     }
 
+    HWND owner_{};
     ProcessInstanceId process_;
     ConnectionAggregator& aggregator_;
     ProcessInfoCache& process_cache_;
@@ -396,7 +404,7 @@ HWND CreateConnectionWindow(HINSTANCE instance, HWND owner, ProcessInstanceId pr
 
     std::wstring title = process_name + L"（PID " + std::to_wstring(process.pid) +
                          L"）连接明细";
-    auto* state = new ConnectionWindow(process, aggregator, process_cache);
+    auto* state = new ConnectionWindow(owner, process, aggregator, process_cache);
     ConnectionWindow::CreationContext context{state};
     HWND window = CreateWindowExW(
         extended_style, kWindowClassName, title.c_str(), style,
