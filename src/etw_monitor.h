@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -41,6 +42,10 @@ struct EtwLossCounters {
 
 class EtwMonitor {
 public:
+    using EventSubmitter =
+        std::function<void(TrafficAggregator&, ConnectionAggregator&, const TrafficEvent&,
+                           const ConnectionEvent&)>;
+
     EtwMonitor(TrafficAggregator& aggregator, ConnectionAggregator& connection_aggregator,
                ProcessInfoCache& process_cache);
     EtwMonitor(TrafficAggregator& aggregator, ConnectionAggregator& connection_aggregator,
@@ -48,6 +53,9 @@ public:
     EtwMonitor(TrafficAggregator& aggregator, ConnectionAggregator& connection_aggregator,
                ProcessInfoCache& process_cache, IEtwSessionApi& session_api,
                EtwDecoder::SchemaLoader schema_loader);
+    EtwMonitor(TrafficAggregator& aggregator, ConnectionAggregator& connection_aggregator,
+               ProcessInfoCache& process_cache, IEtwSessionApi& session_api,
+               EtwDecoder::SchemaLoader schema_loader, EventSubmitter event_submitter);
     // Lifetime precondition: destruction must occur outside the ETW consumer/callback thread.
     ~EtwMonitor();
 
@@ -82,6 +90,7 @@ private:
     ProcessInfoCache& process_cache_;
     IEtwSessionApi& session_api_;
     EtwDecoder decoder_;
+    EventSubmitter event_submitter_;
 
     mutable std::mutex transition_mutex_;
     mutable std::mutex api_mutex_;

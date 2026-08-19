@@ -56,6 +56,13 @@ bool IsCompletedStopResult(ULONG result) {
            result == ERROR_WMI_INSTANCE_NOT_FOUND || result == ERROR_ACTIVE_CONNECTIONS;
 }
 
+void SubmitEvents(TrafficAggregator& aggregator, ConnectionAggregator& connection_aggregator,
+                  const TrafficEvent& traffic_event,
+                  const ConnectionEvent& connection_event) {
+    aggregator.Add(traffic_event);
+    connection_aggregator.Add(connection_event);
+}
+
 }  // namespace
 
 thread_local EtwMonitor* EtwMonitor::current_consumer_ = nullptr;
@@ -74,11 +81,20 @@ EtwMonitor::EtwMonitor(TrafficAggregator& aggregator,
                        ConnectionAggregator& connection_aggregator,
                        ProcessInfoCache& process_cache, IEtwSessionApi& session_api,
                        EtwDecoder::SchemaLoader schema_loader)
+    : EtwMonitor(aggregator, connection_aggregator, process_cache, session_api,
+                 std::move(schema_loader), SubmitEvents) {}
+
+EtwMonitor::EtwMonitor(TrafficAggregator& aggregator,
+                       ConnectionAggregator& connection_aggregator,
+                       ProcessInfoCache& process_cache, IEtwSessionApi& session_api,
+                       EtwDecoder::SchemaLoader schema_loader,
+                       EventSubmitter event_submitter)
     : aggregator_(aggregator),
       connection_aggregator_(connection_aggregator),
       process_cache_(process_cache),
       session_api_(session_api),
-      decoder_(std::move(schema_loader)) {}
+      decoder_(std::move(schema_loader)),
+      event_submitter_(std::move(event_submitter)) {}
 
 EtwMonitor::~EtwMonitor() {
     Stop();
@@ -272,14 +288,16 @@ void EtwMonitor::HandleEvent(const EVENT_RECORD& record) {
         decoded->transport, decoded->direction, decoded->source_port,
         decoded->destination_port);
     const auto observed_at = std::chrono::steady_clock::now();
-    aggregator_.Add({{process.id, decoded->transport, application_protocol}, process.name,
-                     decoded->direction, decoded->bytes});
-    connection_aggregator_.Add(
-        {BuildConnectionKey(process.id, decoded->transport, application_protocol,
-                            decoded->direction, decoded->source_address,
-                            decoded->source_port, decoded->destination_address,
-                            decoded->destination_port),
-         process.name, decoded->direction, decoded->bytes, observed_at});
+    const TrafficEvent traffic_event{
+        {process.id, decoded->transport, application_protocol}, process.name,
+        decoded->direction, decoded->bytes};
+    const ConnectionEvent connection_event{
+        BuildConnectionKey(process.id, decoded->transport, application_protocol,
+                           decoded->direction, decoded->source_address,
+                           decoded->source_port, decoded->destination_address,
+                           decoded->destination_port),
+        process.name, decoded->direction, decoded->bytes, observed_at};
+    event_submitter_(aggregator_, connection_aggregator_, traffic_event, connection_event);
 }
 
 void EtwMonitor::RequestStop() {

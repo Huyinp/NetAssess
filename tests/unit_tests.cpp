@@ -1963,6 +1963,68 @@ void TestEtwMonitorCallbackContainsExceptionsAndStopsSafely() {
     monitor.Stop();
 }
 
+void TestEtwMonitorCallbackContainsLateSubmissionExceptionsAndStopsSafely() {
+    const ProcessInstanceId process_id{1234, 55};
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    TrafficAggregator traffic_aggregator;
+    ConnectionAggregator connection_aggregator;
+    FakeProcessInfoApi process_api;
+    process_api.query_results = {ProcessInfo{process_id, L"browser.exe", true}};
+    ProcessInfoCache process_cache(process_api);
+    FakeEtwSessionApi api;
+    bool traffic_submitted{};
+    bool connection_submitted{};
+    EtwMonitor monitor(
+        traffic_aggregator, connection_aggregator, process_cache, api,
+        [](const EVENT_RECORD&) -> std::optional<EventLayout> {
+            return MakeIpv4Layout(TrafficDirection::Send, TransportProtocol::Tcp);
+        },
+        [&](TrafficAggregator& traffic, ConnectionAggregator& connections,
+            const TrafficEvent& traffic_event, const ConnectionEvent& connection_event) {
+            traffic.Add(traffic_event);
+            traffic_submitted = true;
+            connections.Add(connection_event);
+            connection_submitted = true;
+            throw std::runtime_error("submission failure");
+        });
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+
+    std::array payload{
+        std::byte{0xD2}, std::byte{0x04}, std::byte{0x00}, std::byte{0x00},
+        std::byte{0x00}, std::byte{0x08}, std::byte{0x00}, std::byte{0x00},
+        std::byte{198}, std::byte{51}, std::byte{100}, std::byte{2},
+        std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1},
+        std::byte{0x01}, std::byte{0xBB}, std::byte{0xC3}, std::byte{0x50},
+    };
+    EVENT_RECORD record{};
+    record.EventHeader.ProviderId =
+        GUID{0x9a280ac0, 0xc8e0, 0x11d1, {0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2}};
+    record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_SEND;
+    record.EventHeader.Flags = EVENT_HEADER_FLAG_64_BIT_HEADER;
+    record.EventHeader.TimeStamp.QuadPart = 100;
+    record.UserData = payload.data();
+    record.UserDataLength = static_cast<USHORT>(payload.size());
+    api.InvokeEventCallback(record);
+
+    CHECK_EQ(traffic_submitted, true);
+    CHECK_EQ(connection_submitted, true);
+    const auto traffic_rows = traffic_aggregator.Snapshot(t0);
+    CHECK_EQ(traffic_rows.size(), 1ULL);
+    if (!traffic_rows.empty()) {
+        CHECK_EQ(traffic_rows[0].key.process.pid, process_id.pid);
+        CHECK_EQ(traffic_rows[0].key.application_protocol, ApplicationProtocol::HttpsTls);
+    }
+    CHECK_EQ(connection_aggregator.Snapshot(process_id, t0).size(), 1ULL);
+    CHECK_EQ(process_api.query_process_calls, 1);
+    CHECK_EQ(api.WaitForClose(), true);
+    CHECK_EQ(monitor.running(), false);
+    CHECK_EQ(monitor.last_error(), static_cast<ULONG>(ERROR_UNHANDLED_EXCEPTION));
+    CHECK_EQ(api.control_stop_calls, 1);
+    CHECK_EQ(api.close_trace_calls, 1);
+    monitor.Stop();
+}
+
 void TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart() {
     TrafficAggregator aggregator;
     ConnectionAggregator connection_aggregator;
@@ -2076,6 +2138,7 @@ int main(int argc, char** argv) {
     TestEtwMonitorRetainsSessionOwnershipAfterFailedStop();
     TestEtwMonitorActualCallbackAggregatesCanonicalConnection();
     TestEtwMonitorCallbackContainsExceptionsAndStopsSafely();
+    TestEtwMonitorCallbackContainsLateSubmissionExceptionsAndStopsSafely();
     TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart();
     TestEtwMonitorExternalJoinDoesNotBlockConsumerThreadStop();
 
