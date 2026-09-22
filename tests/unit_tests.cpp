@@ -3,6 +3,7 @@
 #include "connection_aggregator.h"
 #include "connection_view.h"
 #include "connection_window.h"
+#include "csv_export.h"
 #include "formatting.h"
 #include "main_window.h"
 #include "process_info.h"
@@ -2420,6 +2421,72 @@ void TestEtwMonitorExternalJoinDoesNotBlockConsumerThreadStop() {
     CHECK_EQ(RunEtwMonitorStopInterleavingProcess(), static_cast<DWORD>(ERROR_SUCCESS));
 }
 
+void TestCsvBuildEncodesUtf8BomAndEscapesFields() {
+    const std::vector<std::wstring> headers{L"进程名", L"说明"};
+    const std::vector<std::vector<std::wstring>> rows{
+        {L"程序.exe", L"逗号,引号\"和\r\n换行"},
+    };
+
+    const CsvBuildResult result = BuildCsvUtf8(headers, rows);
+
+    CHECK_EQ(result.error, static_cast<DWORD>(ERROR_SUCCESS));
+    CHECK_EQ(result.bytes,
+             "\xEF\xBB\xBF进程名,说明\r\n程序.exe,\"逗号,引号\"\"和\r\n换行\"\r\n");
+}
+
+void TestCsvBuildEmptyTableContainsOnlyUtf8Bom() {
+    const std::vector<std::wstring> headers;
+    const std::vector<std::vector<std::wstring>> rows;
+
+    const CsvBuildResult result = BuildCsvUtf8(headers, rows);
+
+    CHECK_EQ(result.error, static_cast<DWORD>(ERROR_SUCCESS));
+    CHECK_EQ(result.bytes, "\xEF\xBB\xBF");
+}
+
+void TestCsvBuildRejectsUnevenRows() {
+    const std::vector<std::wstring> headers{L"first", L"second"};
+    const std::vector<std::vector<std::wstring>> rows{{L"only"}};
+
+    const CsvBuildResult result = BuildCsvUtf8(headers, rows);
+
+    CHECK_EQ(result.error, static_cast<DWORD>(ERROR_INVALID_DATA));
+}
+
+void TestWriteCsvFileWritesExactBytesToTemporaryFile() {
+    wchar_t temporary_path[MAX_PATH]{};
+    const bool has_temporary_path = GetTempPathW(MAX_PATH, temporary_path) > 0;
+    CHECK_EQ(has_temporary_path, true);
+    if (!has_temporary_path) {
+        return;
+    }
+
+    wchar_t temporary_file[MAX_PATH]{};
+    const bool has_temporary_file = GetTempFileNameW(temporary_path, L"nac", 0, temporary_file) != 0;
+    CHECK_EQ(has_temporary_file, true);
+    if (!has_temporary_file) {
+        return;
+    }
+    const std::wstring path = temporary_file;
+    const std::string bytes{"\xEF\xBB\xBF" "a,b\r\n"};
+
+    CHECK_EQ(WriteCsvFile(path, bytes), static_cast<DWORD>(ERROR_SUCCESS));
+
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK_EQ(file != INVALID_HANDLE_VALUE, true);
+    if (file != INVALID_HANDLE_VALUE) {
+        std::array<char, 16> actual{};
+        DWORD bytes_read{};
+        CHECK_EQ(ReadFile(file, actual.data(), static_cast<DWORD>(actual.size()), &bytes_read, nullptr) !=
+                     FALSE,
+                 true);
+        CHECK_EQ(std::string_view(actual.data(), bytes_read), std::string_view(bytes));
+        CHECK_EQ(CloseHandle(file) != FALSE, true);
+    }
+    CHECK_EQ(DeleteFileW(path.c_str()) != FALSE, true);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2515,6 +2582,10 @@ int main(int argc, char** argv) {
     TestClearWaitsForBothEventSubmissions();
     TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart();
     TestEtwMonitorExternalJoinDoesNotBlockConsumerThreadStop();
+    TestCsvBuildEncodesUtf8BomAndEscapesFields();
+    TestCsvBuildEmptyTableContainsOnlyUtf8Bom();
+    TestCsvBuildRejectsUnevenRows();
+    TestWriteCsvFileWritesExactBytesToTemporaryFile();
 
     return failures == 0 ? 0 : 1;
 }
