@@ -1,3 +1,5 @@
+#include "network_rate_monitor.h"
+
 #include "etw_decoder.h"
 #include "etw_monitor.h"
 #include "connection_aggregator.h"
@@ -426,6 +428,33 @@ public:
     int query_process_calls{};
     int query_creation_time_calls{};
 };
+
+class FakeNetworkInterfaceApi final : public INetworkInterfaceApi {
+public:
+    DWORD Query(std::vector<NetworkInterfaceCounters>& rows) override {
+        if (query_index < results.size()) {
+            rows = results[query_index].rows;
+            return results[query_index++].error;
+        }
+        rows.clear();
+        return ERROR_SUCCESS;
+    }
+
+    struct Result {
+        DWORD error;
+        std::vector<NetworkInterfaceCounters> rows;
+    };
+
+    std::vector<Result> results;
+    std::size_t query_index{};
+};
+
+NetworkInterfaceCounters MakeNetworkInterface(std::uint64_t luid, std::uint64_t received,
+                                               std::uint64_t sent,
+                                               IF_OPER_STATUS status = IfOperStatusUp,
+                                               NET_IFTYPE type = IF_TYPE_ETHERNET_CSMACD) {
+    return {luid, status, type, received, sent};
+}
 
 int RunEtwMonitorStopInterleavingChild() {
     TrafficAggregator aggregator;
@@ -2601,6 +2630,132 @@ void TestWriteCsvFileWritesExactBytesToTemporaryFile() {
     CHECK_EQ(DeleteFileW(path.c_str()) != FALSE, true);
 }
 
+void TestNetworkRatesSumOnlyUpNonLoopbackInterfaces() {
+    FakeNetworkInterfaceApi api;
+    api.results = {
+        {ERROR_SUCCESS,
+         {MakeNetworkInterface(1, 100, 50), MakeNetworkInterface(2, 400, 200),
+          MakeNetworkInterface(3, 900, 900, IfOperStatusDown),
+          MakeNetworkInterface(4, 800, 800, IfOperStatusUp, IF_TYPE_SOFTWARE_LOOPBACK)}},
+        {ERROR_SUCCESS,
+         {MakeNetworkInterface(1, 1100, 550), MakeNetworkInterface(2, 400, 200),
+          MakeNetworkInterface(3, 1900, 1900, IfOperStatusDown),
+          MakeNetworkInterface(4, 1800, 1800, IfOperStatusUp, IF_TYPE_SOFTWARE_LOOPBACK)}},
+    };
+    NetworkRateMonitor monitor(api);
+    const auto t0 = std::chrono::steady_clock::time_point{};
+
+    const NetworkRateSnapshot initial = monitor.Snapshot(t0);
+    const NetworkRateSnapshot rates = monitor.Snapshot(t0 + std::chrono::seconds(2));
+
+    CHECK_EQ(initial.error, static_cast<DWORD>(ERROR_SUCCESS));
+    CHECK_EQ(initial.received_bytes_per_second, 0.0);
+    CHECK_EQ(initial.sent_bytes_per_second, 0.0);
+    CHECK_EQ(rates.error, static_cast<DWORD>(ERROR_SUCCESS));
+    CHECK_EQ(rates.received_bytes_per_second, 500.0);
+    CHECK_EQ(rates.sent_bytes_per_second, 250.0);
+}
+
+void TestNetworkRatesSumMultipleValidInterfaces() {
+    FakeNetworkInterfaceApi api;
+    api.results = {
+        {ERROR_SUCCESS, {MakeNetworkInterface(1, 100, 50), MakeNetworkInterface(2, 400, 200)}},
+        {ERROR_SUCCESS, {MakeNetworkInterface(1, 1100, 550), MakeNetworkInterface(2, 2400, 1200)}},
+    };
+    NetworkRateMonitor monitor(api);
+    const auto t0 = std::chrono::steady_clock::time_point{};
+
+    monitor.Snapshot(t0);
+    const NetworkRateSnapshot rates = monitor.Snapshot(t0 + std::chrono::seconds(2));
+
+    CHECK_EQ(rates.received_bytes_per_second, 1500.0);
+    CHECK_EQ(rates.sent_bytes_per_second, 750.0);
+}
+
+void TestNetworkRatesStartNewAndReturnedInterfacesAtZero() {
+    FakeNetworkInterfaceApi api;
+    api.results = {
+        {ERROR_SUCCESS, {MakeNetworkInterface(1, 100, 50)}},
+        {ERROR_SUCCESS, {MakeNetworkInterface(1, 1100, 550), MakeNetworkInterface(2, 100, 50)}},
+        {ERROR_SUCCESS, {MakeNetworkInterface(2, 200, 100)}},
+        {ERROR_SUCCESS, {MakeNetworkInterface(1, 2100, 1050), MakeNetworkInterface(2, 300, 150)}},
+    };
+    NetworkRateMonitor monitor(api);
+    const auto t0 = std::chrono::steady_clock::time_point{};
+
+    monitor.Snapshot(t0);
+    const NetworkRateSnapshot new_interface = monitor.Snapshot(t0 + std::chrono::seconds(1));
+    const NetworkRateSnapshot removed_interface = monitor.Snapshot(t0 + std::chrono::seconds(2));
+    const NetworkRateSnapshot returned_interface = monitor.Snapshot(t0 + std::chrono::seconds(3));
+
+    CHECK_EQ(new_interface.received_bytes_per_second, 1000.0);
+    CHECK_EQ(new_interface.sent_bytes_per_second, 500.0);
+    CHECK_EQ(removed_interface.received_bytes_per_second, 100.0);
+    CHECK_EQ(removed_interface.sent_bytes_per_second, 50.0);
+    CHECK_EQ(returned_interface.received_bytes_per_second, 100.0);
+    CHECK_EQ(returned_interface.sent_bytes_per_second, 50.0);
+}
+
+void TestNetworkRatesKeepLastValidBaselineForRollbackAndInvalidTimes() {
+    FakeNetworkInterfaceApi api;
+    api.results = {
+        {ERROR_SUCCESS, {MakeNetworkInterface(1, 100, 50)}},
+        {ERROR_SUCCESS, {MakeNetworkInterface(1, 50, 25)}},
+        {ERROR_SUCCESS, {MakeNetworkInterface(1, 150, 75)}},
+        {ERROR_SUCCESS, {MakeNetworkInterface(1, 175, 80)}},
+        {ERROR_SUCCESS, {MakeNetworkInterface(1, 1100, 550)}},
+    };
+    NetworkRateMonitor monitor(api);
+    const auto t0 = std::chrono::steady_clock::time_point{};
+
+    monitor.Snapshot(t0);
+    const NetworkRateSnapshot rollback = monitor.Snapshot(t0 + std::chrono::seconds(1));
+    const NetworkRateSnapshot equal_time = monitor.Snapshot(t0);
+    const NetworkRateSnapshot earlier_time = monitor.Snapshot(t0 - std::chrono::seconds(1));
+    const NetworkRateSnapshot recovered = monitor.Snapshot(t0 + std::chrono::seconds(2));
+
+    CHECK_EQ(rollback.received_bytes_per_second, 0.0);
+    CHECK_EQ(rollback.sent_bytes_per_second, 0.0);
+    CHECK_EQ(equal_time.received_bytes_per_second, 0.0);
+    CHECK_EQ(equal_time.sent_bytes_per_second, 0.0);
+    CHECK_EQ(earlier_time.received_bytes_per_second, 0.0);
+    CHECK_EQ(earlier_time.sent_bytes_per_second, 0.0);
+    CHECK_EQ(recovered.received_bytes_per_second, 500.0);
+    CHECK_EQ(recovered.sent_bytes_per_second, 250.0);
+}
+
+void TestNetworkRatesPreserveBaselinesAcrossApiFailures() {
+    FakeNetworkInterfaceApi api;
+    api.results = {
+        {ERROR_SUCCESS, {MakeNetworkInterface(1, 100, 50)}},
+        {ERROR_ACCESS_DENIED, {}},
+        {ERROR_SUCCESS, {MakeNetworkInterface(1, 1100, 550)}},
+    };
+    NetworkRateMonitor monitor(api);
+    const auto t0 = std::chrono::steady_clock::time_point{};
+
+    monitor.Snapshot(t0);
+    const NetworkRateSnapshot failed = monitor.Snapshot(t0 + std::chrono::seconds(1));
+    const NetworkRateSnapshot recovered = monitor.Snapshot(t0 + std::chrono::seconds(2));
+
+    CHECK_EQ(failed.error, static_cast<DWORD>(ERROR_ACCESS_DENIED));
+    CHECK_EQ(failed.received_bytes_per_second, 0.0);
+    CHECK_EQ(failed.sent_bytes_per_second, 0.0);
+    CHECK_EQ(recovered.error, static_cast<DWORD>(ERROR_SUCCESS));
+    CHECK_EQ(recovered.received_bytes_per_second, 500.0);
+    CHECK_EQ(recovered.sent_bytes_per_second, 250.0);
+}
+
+void TestDefaultNetworkRateMonitorQueriesInterfaces() {
+    NetworkRateMonitor monitor;
+
+    const NetworkRateSnapshot snapshot = monitor.Snapshot(std::chrono::steady_clock::now());
+
+    CHECK_EQ(snapshot.error, static_cast<DWORD>(ERROR_SUCCESS));
+    CHECK_EQ(snapshot.received_bytes_per_second, 0.0);
+    CHECK_EQ(snapshot.sent_bytes_per_second, 0.0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2702,6 +2857,12 @@ int main(int argc, char** argv) {
     TestCsvBuildEmptyTableContainsOnlyUtf8Bom();
     TestCsvBuildRejectsUnevenRows();
     TestWriteCsvFileWritesExactBytesToTemporaryFile();
+    TestNetworkRatesSumOnlyUpNonLoopbackInterfaces();
+    TestNetworkRatesSumMultipleValidInterfaces();
+    TestNetworkRatesStartNewAndReturnedInterfacesAtZero();
+    TestNetworkRatesKeepLastValidBaselineForRollbackAndInvalidTimes();
+    TestNetworkRatesPreserveBaselinesAcrossApiFailures();
+    TestDefaultNetworkRateMonitorQueriesInterfaces();
 
     return failures == 0 ? 0 : 1;
 }
