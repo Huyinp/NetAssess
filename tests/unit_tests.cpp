@@ -2,6 +2,7 @@
 #include "etw_monitor.h"
 #include "connection_aggregator.h"
 #include "connection_view.h"
+#include "connection_window.h"
 #include "formatting.h"
 #include "main_window.h"
 #include "process_info.h"
@@ -31,6 +32,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <tdh.h>
+#include <commctrl.h>
 
 namespace {
 
@@ -234,7 +236,7 @@ public:
             }
             properties->EventsLost = query_events_lost;
             properties->RealTimeBuffersLost = query_real_time_buffers_lost;
-            return ERROR_SUCCESS;
+            return query_status;
         }
 
         ++control_stop_calls;
@@ -339,6 +341,7 @@ public:
     }
 
     ULONG start_status{ERROR_SUCCESS};
+    ULONG query_status{ERROR_SUCCESS};
     ULONG open_error{ERROR_INVALID_HANDLE};
     ULONG process_status{ERROR_CANCELLED};
     ULONG close_status{ERROR_SUCCESS};
@@ -1868,6 +1871,134 @@ void TestEtwMonitorDoesNotReportSuccessfulPendingStopCodesAsErrors() {
     }
 }
 
+void TestEtwMonitorStopPublishesStateOnlyAfterTransitionLock() {
+    TrafficAggregator traffic;
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    FakeEtwSessionApi api;
+    api.block_query = true;
+    EtwMonitor monitor(traffic, connections, cache, api);
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+    std::jthread query([&] { monitor.loss_counters(); });
+    CHECK_EQ(api.WaitForQuery(), true);
+    std::atomic_bool entered{};
+    std::jthread stop([&] { entered = true; monitor.Stop(); });
+    while (!entered.load()) { std::this_thread::yield(); }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    while (monitor.running() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    // A blocked external Stop must not invite Start to join an unsignalled consumer.
+    CHECK_EQ(monitor.running(), true);
+    api.ReleaseQuery();
+    query.join();
+    stop.join();
+    CHECK_EQ(monitor.Start(), true);
+    monitor.Stop();
+}
+
+void TestEtwMonitorBadLengthStopReleasesOwnershipButRetainsValidCounters() {
+    TrafficAggregator traffic;
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    FakeEtwSessionApi api;
+    api.query_events_lost = 5;
+    api.query_real_time_buffers_lost = 7;
+    api.stop_events_lost = 99;
+    api.stop_real_time_buffers_lost = 101;
+    api.control_status = ERROR_BAD_LENGTH;
+    EtwMonitor monitor(traffic, connections, cache, api);
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+    CHECK_EQ(monitor.loss_counters().events_lost, 5ULL);
+    monitor.Stop();
+    CHECK_EQ(monitor.last_error(), static_cast<ULONG>(ERROR_SUCCESS));
+    const auto loss = monitor.loss_counters();
+    CHECK_EQ(loss.events_lost, 5ULL);
+    CHECK_EQ(loss.real_time_buffers_lost, 7ULL);
+    CHECK_EQ(monitor.Start(), true);
+    monitor.Stop();
+}
+
+void TestMainWindowRetriesFailedStopInsteadOfStartingAnotherSession() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    TrafficAggregator traffic;
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    FakeEtwSessionApi api;
+    api.control_stop_statuses = {ERROR_ACCESS_DENIED, ERROR_SUCCESS};
+    api.query_status = ERROR_INVALID_DATA;
+    EtwMonitor monitor(traffic, connections, cache, api);
+    HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections, cache, monitor);
+    CHECK_EQ(window != nullptr, true);
+    if (window == nullptr) { return; }
+    CHECK_EQ(StartMainWindowCollection(window), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+    SendMessageW(window, WM_COMMAND, MAKEWPARAM(1001, BN_CLICKED), 0);
+    CHECK_EQ(monitor.last_error(), static_cast<ULONG>(ERROR_ACCESS_DENIED));
+    SendMessageW(window, WM_COMMAND, MAKEWPARAM(1001, BN_CLICKED), 0);
+    CHECK_EQ(api.control_stop_calls, 2);
+    CHECK_EQ(api.start_trace_calls, 1);
+    SendMessageW(window, WM_COMMAND, MAKEWPARAM(1001, BN_CLICKED), 0);
+    CHECK_EQ(api.start_trace_calls, 2);
+    CHECK_EQ(monitor.running(), true);
+    DestroyWindow(window);
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
+}
+
+thread_local WNDPROC original_detail_list_procedure{};
+
+LRESULT CALLBACK FailDetailColumnProcedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == LVM_INSERTCOLUMNW) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return -1;
+    }
+    const LRESULT result = CallWindowProcW(original_detail_list_procedure, window, message, wparam, lparam);
+    if (message == WM_NCDESTROY) { SetLastError(ERROR_SUCCESS); }
+    return result;
+}
+
+LRESULT CALLBACK FailDetailColumnHook(int code, WPARAM wparam, LPARAM lparam) {
+    if (code == HCBT_CREATEWND) {
+        wchar_t name[64]{};
+        HWND window = reinterpret_cast<HWND>(wparam);
+        GetClassNameW(window, name, static_cast<int>(std::size(name)));
+        if (std::wstring_view(name) == WC_LISTVIEWW) {
+            original_detail_list_procedure = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+                window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(FailDetailColumnProcedure)));
+        }
+    }
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+
+void TestConnectionCreationPreservesErrorAcrossDestruction() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    const auto key = MakeConnectionKey({42, 100}, TransportProtocol::Tcp,
+        ApplicationProtocol::HttpsTls, 50000, 443);
+    connections.Add({key, L"test.exe", TrafficDirection::Send, 128, {}});
+    HHOOK hook = SetWindowsHookExW(WH_CBT, FailDetailColumnHook, nullptr, GetCurrentThreadId());
+    CHECK_EQ(hook != nullptr, true);
+    if (hook == nullptr) { return; }
+    const auto failed = CreateConnectionWindow(GetModuleHandleW(nullptr), nullptr,
+        key.process, L"test.exe", connections, cache);
+    UnhookWindowsHookEx(hook);
+    CHECK_EQ(failed.window == nullptr, true);
+    CHECK_EQ(failed.error, static_cast<DWORD>(ERROR_NOT_ENOUGH_MEMORY));
+    if (failed.window != nullptr) { DestroyWindow(failed.window); }
+    CHECK_EQ(connections.Snapshot(key.process, {}).size(), 1ULL);
+    const auto created = CreateConnectionWindow(GetModuleHandleW(nullptr), nullptr,
+        key.process, L"test.exe", connections, cache);
+    CHECK_EQ(created.window != nullptr, true);
+    CHECK_EQ(created.error, static_cast<DWORD>(ERROR_SUCCESS));
+    if (created.window != nullptr) { DestroyWindow(created.window); }
+}
+
 void TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop() {
     for (int iteration = 0; iteration < 100; ++iteration) {
         TrafficAggregator aggregator;
@@ -2202,6 +2333,62 @@ void TestEtwMonitorCallbackContainsLateSubmissionExceptionsAndStopsSafely() {
     monitor.Stop();
 }
 
+void TestClearWaitsForBothEventSubmissions() {
+    const ProcessInstanceId process{1234, 55};
+    TrafficAggregator traffic;
+    ConnectionAggregator connections;
+    FakeProcessInfoApi process_api;
+    process_api.query_results = {ProcessInfo{process, L"test.exe", true}};
+    ProcessInfoCache cache(process_api);
+    FakeEtwSessionApi api;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool first_submitted{}, release_second{}, clear_entered{}, cleared{};
+    EtwMonitor monitor(traffic, connections, cache, api,
+        [](const EVENT_RECORD&) { return MakeIpv4Layout(TrafficDirection::Send, TransportProtocol::Tcp); },
+        [&](TrafficAggregator& main, ConnectionAggregator& detail,
+            const TrafficEvent& first, const ConnectionEvent& second) {
+            main.Add(first);
+            std::unique_lock lock(mutex);
+            first_submitted = true;
+            condition.notify_all();
+            condition.wait(lock, [&] { return release_second; });
+            detail.Add(second);
+        });
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+    std::array<std::byte, 20> payload{};
+    payload[0] = std::byte{0xd2}; payload[1] = std::byte{4}; payload[4] = std::byte{64};
+    EVENT_RECORD record{};
+    record.EventHeader.ProviderId = GUID{0x9a280ac0, 0xc8e0, 0x11d1, {0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2}};
+    record.EventHeader.EventDescriptor.Opcode = EVENT_TRACE_TYPE_SEND;
+    record.EventHeader.Flags = EVENT_HEADER_FLAG_64_BIT_HEADER;
+    record.UserData = payload.data();
+    record.UserDataLength = static_cast<USHORT>(payload.size());
+    std::jthread submit([&] { api.InvokeEventCallback(record); });
+    {
+        std::unique_lock lock(mutex);
+        CHECK_EQ(condition.wait_for(lock, std::chrono::seconds(2), [&] { return first_submitted; }), true);
+    }
+    std::jthread clear([&] {
+        { std::lock_guard lock(mutex); clear_entered = true; condition.notify_all(); }
+        monitor.ClearStatistics();
+        { std::lock_guard lock(mutex); cleared = true; condition.notify_all(); }
+    });
+    {
+        std::unique_lock lock(mutex);
+        CHECK_EQ(condition.wait_for(lock, std::chrono::seconds(2), [&] { return clear_entered; }), true);
+        CHECK_EQ(condition.wait_for(lock, std::chrono::milliseconds(100), [&] { return cleared; }), false);
+        release_second = true;
+        condition.notify_all();
+    }
+    submit.join();
+    clear.join();
+    CHECK_EQ(traffic.Snapshot(std::chrono::steady_clock::now()).empty(), true);
+    CHECK_EQ(connections.Snapshot(process, std::chrono::steady_clock::now()).empty(), true);
+    monitor.Stop();
+}
+
 void TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart() {
     TrafficAggregator aggregator;
     ConnectionAggregator connection_aggregator;
@@ -2313,6 +2500,10 @@ int main(int argc, char** argv) {
     TestEtwMonitorCleansOwnedSessionWhenOpenTraceFails();
     TestEtwMonitorCleansOwnedResourcesWhenConsumerFails();
     TestEtwMonitorDoesNotReportSuccessfulPendingStopCodesAsErrors();
+    TestEtwMonitorStopPublishesStateOnlyAfterTransitionLock();
+    TestEtwMonitorBadLengthStopReleasesOwnershipButRetainsValidCounters();
+    TestMainWindowRetriesFailedStopInsteadOfStartingAnotherSession();
+    TestConnectionCreationPreservesErrorAcrossDestruction();
     TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop();
     TestEtwMonitorSerializesLossCountersWithConsumerCleanup();
     TestEtwMonitorExposesRealTimeBufferLossSeparately();
@@ -2321,6 +2512,7 @@ int main(int argc, char** argv) {
     TestEtwMonitorActualCallbackAggregatesCanonicalConnection();
     TestEtwMonitorCallbackContainsExceptionsAndStopsSafely();
     TestEtwMonitorCallbackContainsLateSubmissionExceptionsAndStopsSafely();
+    TestClearWaitsForBothEventSubmissions();
     TestEtwMonitorAllowsConsumerThreadStopAndExternalRestart();
     TestEtwMonitorExternalJoinDoesNotBlockConsumerThreadStop();
 

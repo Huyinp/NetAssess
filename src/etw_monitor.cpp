@@ -52,7 +52,7 @@ bool IsIgnorableCloseResult(ULONG result) {
 }
 
 bool IsCompletedStopResult(ULONG result) {
-    return result == ERROR_SUCCESS || result == ERROR_MORE_DATA ||
+    return result == ERROR_SUCCESS || result == ERROR_BAD_LENGTH || result == ERROR_MORE_DATA ||
            result == ERROR_WMI_INSTANCE_NOT_FOUND || result == ERROR_ACTIVE_CONNECTIONS;
 }
 
@@ -106,7 +106,12 @@ bool EtwMonitor::Start() {
         return true;
     }
 
-    if (session_handle_ != 0) {
+    bool owns_session;
+    {
+        std::lock_guard api_lock(api_mutex_);
+        owns_session = session_handle_ != 0;
+    }
+    if (owns_session) {
         FinalizeStoppedSession();
         return false;
     }
@@ -191,19 +196,32 @@ bool EtwMonitor::Start() {
 }
 
 void EtwMonitor::Stop() {
-    running_.store(false, std::memory_order_release);
     if (current_consumer_ == this) {
+        running_.store(false, std::memory_order_release);
         RequestStop();
         return;
     }
 
     std::lock_guard lock(transition_mutex_);
+    running_.store(false, std::memory_order_release);
     RequestStop();
     FinalizeStoppedSession();
 }
 
 bool EtwMonitor::running() const noexcept {
     return running_.load(std::memory_order_acquire);
+}
+
+bool EtwMonitor::cleanup_pending() const {
+    std::lock_guard transition_lock(transition_mutex_);
+    std::lock_guard api_lock(api_mutex_);
+    return !running_.load(std::memory_order_acquire) && session_handle_ != 0;
+}
+
+void EtwMonitor::ClearStatistics() {
+    std::lock_guard lock(statistics_mutex_);
+    aggregator_.Clear();
+    connection_aggregator_.Clear();
 }
 
 EtwLossCounters EtwMonitor::loss_counters() const {
@@ -297,10 +315,12 @@ void EtwMonitor::HandleEvent(const EVENT_RECORD& record) {
                            decoded->source_port, decoded->destination_address,
                            decoded->destination_port),
         process.name, decoded->direction, decoded->bytes, observed_at};
+    std::lock_guard lock(statistics_mutex_);
     event_submitter_(aggregator_, connection_aggregator_, traffic_event, connection_event);
 }
 
 void EtwMonitor::RequestStop() {
+    std::lock_guard api_lock(api_mutex_);
     bool expected = false;
     if ((session_handle_ != 0 || trace_handle_ != INVALID_PROCESSTRACE_HANDLE) &&
         cleanup_started_.compare_exchange_strong(expected, true,
@@ -310,15 +330,16 @@ void EtwMonitor::RequestStop() {
 }
 
 void EtwMonitor::CloseOwnedResources() {
-    std::lock_guard api_lock(api_mutex_);
     if (session_handle_ != 0) {
         const ULONG result = session_api_.ControlTraceW(
             session_handle_, session_name_.c_str(), properties(), EVENT_TRACE_CONTROL_STOP);
         if (IsCompletedStopResult(result)) {
-            StoreLossCounters(*properties());
+            if (result == ERROR_SUCCESS) {
+                StoreLossCounters(*properties());
+            }
             session_handle_ = 0;
         } else {
-            SetLastErrorIfEmpty(result);
+            last_error_.store(result, std::memory_order_relaxed);
         }
     }
 

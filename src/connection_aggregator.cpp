@@ -62,10 +62,9 @@ std::vector<ConnectionSnapshot> ConnectionAggregator::Snapshot(
     const bool update_baseline = !has_previous_snapshot || has_valid_interval;
 
     std::vector<ConnectionSnapshot> snapshots;
-    for (auto& [key, entry] : entries_) {
-        if (key.process != process) {
-            continue;
-        }
+    for (auto iterator = entries_.lower_bound(ConnectionKey{process});
+         iterator != entries_.end() && iterator->first.process == process; ++iterator) {
+        auto& [key, entry] = *iterator;
 
         ConnectionSnapshot snapshot{key, entry.process_name, entry.sent_bytes, entry.received_bytes,
                                     0.0, 0.0, entry.last_activity};
@@ -93,10 +92,9 @@ std::vector<ConnectionSnapshot> ConnectionAggregator::Snapshot(
 void ConnectionAggregator::ResetSnapshotBaseline(ProcessInstanceId process) {
     std::lock_guard lock(mutex_);
     previous_snapshot_times_.erase(process);
-    for (auto& [key, entry] : entries_) {
-        if (key.process == process) {
-            entry.has_previous_snapshot = false;
-        }
+    for (auto iterator = entries_.lower_bound(ConnectionKey{process});
+         iterator != entries_.end() && iterator->first.process == process; ++iterator) {
+        iterator->second.has_previous_snapshot = false;
     }
 }
 

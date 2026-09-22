@@ -29,6 +29,7 @@ constexpr int kStartStopButtonId = 1001;
 constexpr int kClearButtonId = 1002;
 constexpr int kFilterEditId = 1003;
 constexpr int kViewConnectionDetailsMenuId = 1004;
+constexpr std::array<int, 9> kColumnWidths{190, 72, 72, 92, 170, 105, 105, 105, 105};
 
 bool ContainsCaseInsensitive(std::wstring_view value, std::wstring_view filter) {
     if (filter.empty()) {
@@ -153,6 +154,7 @@ private:
                          suggested->right - suggested->left,
                          suggested->bottom - suggested->top,
                          SWP_NOACTIVATE | SWP_NOZORDER);
+            UpdateColumnWidths();
             LayoutControls();
             return 0;
         }
@@ -225,15 +227,13 @@ private:
             L"进程名", L"PID", L"状态", L"传输层协议", L"推断应用协议",
             L"上行累计", L"上行速度", L"下行累计", L"下行速度",
         };
-        constexpr std::array<int, 9> column_widths{190, 72, 72, 92, 170,
-                                                   105, 105, 105, 105};
         for (int index = 0; index < static_cast<int>(column_names.size()); ++index) {
             LVCOLUMNW column{};
             column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
             column.pszText = const_cast<wchar_t*>(
                 column_names[static_cast<std::size_t>(index)].data());
             column.cx = win32_dpi::Scale(
-                column_widths[static_cast<std::size_t>(index)], dpi_);
+                kColumnWidths[static_cast<std::size_t>(index)], dpi_);
             column.iSubItem = index;
             if (ListView_InsertColumn(list_view_, index, &column) == -1) {
                 return false;
@@ -241,6 +241,13 @@ private:
         }
         LayoutControls();
         return true;
+    }
+
+    void UpdateColumnWidths() const {
+        for (int index = 0; index < static_cast<int>(kColumnWidths.size()); ++index) {
+            ListView_SetColumnWidth(list_view_, index,
+                win32_dpi::Scale(kColumnWidths[static_cast<std::size_t>(index)], dpi_));
+        }
     }
 
     void LayoutControls() {
@@ -281,18 +288,18 @@ private:
 
     void HandleCommand(int control_id, int notification) {
         if (control_id == kStartStopButtonId && notification == BN_CLICKED) {
-            if (monitor_.running()) {
+            if (monitor_.running() || monitor_.cleanup_pending()) {
                 monitor_.Stop();
             } else {
                 monitor_.Start();
             }
             UpdateStatus();
         } else if (control_id == kClearButtonId && notification == BN_CLICKED) {
-            aggregator_.Clear();
-            connection_aggregator_.Clear();
+            monitor_.ClearStatistics();
             last_snapshot_.clear();
             RefreshRows();
             UpdateStatus();
+            RefreshConnectionWindows();
         } else if (control_id == kFilterEditId && notification == EN_CHANGE) {
             RefreshRows();
         }
@@ -388,13 +395,17 @@ private:
             snapshot == last_snapshot_.end() ? L"进程" : snapshot->process_name;
         const HINSTANCE instance = reinterpret_cast<HINSTANCE>(
             GetWindowLongPtrW(window_, GWLP_HINSTANCE));
-        HWND detail = CreateConnectionWindow(
+        const auto created = CreateConnectionWindow(
             instance, window_, process, std::move(process_name),
             connection_aggregator_, process_cache_);
+        HWND detail = created.window;
         if (detail != nullptr) {
             connection_windows_.emplace(process, detail);
             ShowWindow(detail, SW_SHOWNORMAL);
             UpdateWindow(detail);
+        } else {
+            const std::wstring message = L"无法打开连接明细：" + SystemErrorText(created.error);
+            MessageBoxW(window_, message.c_str(), L"NetAssess", MB_OK | MB_ICONERROR);
         }
     }
 
@@ -598,7 +609,8 @@ private:
         }
         const bool running = monitor_.running();
         const EtwLossCounters loss_counters = monitor_.loss_counters();
-        SetWindowTextW(start_stop_button_, running ? L"停止采集" : L"开始采集");
+        SetWindowTextW(start_stop_button_, running ? L"停止采集" :
+                       monitor_.cleanup_pending() ? L"重试清理" : L"开始采集");
         const std::wstring status =
             std::wstring(L"采集状态：") + (running ? L"运行中" : L"已停止") +
             L"  |  事件丢失：" + std::to_wstring(loss_counters.events_lost) +

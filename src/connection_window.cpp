@@ -22,6 +22,11 @@ namespace {
 
 constexpr wchar_t kWindowClassName[] = L"NetAssessConnectionWindow";
 
+DWORD CreationError() {
+    const DWORD error = GetLastError();
+    return error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error;
+}
+
 ConnectionSortColumn SortColumnForListColumn(int column) {
     constexpr std::array columns{
         ConnectionSortColumn::Status,
@@ -84,18 +89,23 @@ public:
     struct CreationContext {
         ConnectionWindow* window;
         bool attached{};
+        DWORD error{};
     };
 
 private:
     LRESULT HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         switch (message) {
-        case WM_CREATE:
+        case WM_CREATE: {
             dpi_ = win32_dpi::Window(window_);
+            SetLastError(ERROR_SUCCESS);
             if (!CreateControls()) {
+                auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+                static_cast<CreationContext*>(create->lpCreateParams)->error = CreationError();
                 return -1;
             }
             aggregator_.ResetSnapshotBaseline(process_);
             return 0;
+        }
         case kConnectionWindowRefreshMessage:
             RefreshSnapshot();
             return 0;
@@ -157,6 +167,7 @@ private:
             column.pszText = const_cast<wchar_t*>(
                 column_names[static_cast<std::size_t>(index)].data());
             column.iSubItem = index;
+            SetLastError(ERROR_SUCCESS);
             if (ListView_InsertColumn(list_view_, index, &column) == -1) {
                 return false;
             }
@@ -389,11 +400,11 @@ bool RegisterWindowClass(HINSTANCE instance) {
 
 }  // namespace
 
-HWND CreateConnectionWindow(HINSTANCE instance, HWND owner, ProcessInstanceId process,
-                            std::wstring process_name, ConnectionAggregator& aggregator,
-                            ProcessInfoCache& process_cache) {
+ConnectionWindowCreationResult CreateConnectionWindow(
+    HINSTANCE instance, HWND owner, ProcessInstanceId process, std::wstring process_name,
+    ConnectionAggregator& aggregator, ProcessInfoCache& process_cache) {
     if (!RegisterWindowClass(instance)) {
-        return nullptr;
+        return {nullptr, CreationError()};
     }
 
     constexpr DWORD style = WS_OVERLAPPEDWINDOW;
@@ -402,18 +413,21 @@ HWND CreateConnectionWindow(HINSTANCE instance, HWND owner, ProcessInstanceId pr
     RECT window_rectangle{0, 0, win32_dpi::Scale(1180, dpi), win32_dpi::Scale(600, dpi)};
     win32_dpi::AdjustWindowRect(window_rectangle, style, extended_style, dpi);
 
-    std::wstring title = process_name + L"（PID " + std::to_wstring(process.pid) +
-                         L"）连接明细";
+    std::wstring title = process_name + L" — PID " + std::to_wstring(process.pid) +
+                         L" — 连接明细";
     auto* state = new ConnectionWindow(owner, process, aggregator, process_cache);
     ConnectionWindow::CreationContext context{state};
+    SetLastError(ERROR_SUCCESS);
     HWND window = CreateWindowExW(
         extended_style, kWindowClassName, title.c_str(), style,
         CW_USEDEFAULT, CW_USEDEFAULT,
         window_rectangle.right - window_rectangle.left,
         window_rectangle.bottom - window_rectangle.top,
         owner, nullptr, instance, &context);
+    const DWORD error = window != nullptr ? ERROR_SUCCESS :
+        context.error != ERROR_SUCCESS ? context.error : CreationError();
     if (window == nullptr && !context.attached) {
         delete state;
     }
-    return window;
+    return {window, error};
 }

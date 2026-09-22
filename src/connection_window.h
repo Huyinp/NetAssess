@@ -18,6 +18,11 @@ class ProcessInfoCache;
 inline constexpr UINT kConnectionWindowRefreshMessage = WM_APP + 2;
 inline constexpr UINT kConnectionWindowClosedMessage = WM_APP + 3;
 
-HWND CreateConnectionWindow(HINSTANCE instance, HWND owner, ProcessInstanceId process,
-                            std::wstring process_name, ConnectionAggregator& aggregator,
-                            ProcessInfoCache& process_cache);
+struct ConnectionWindowCreationResult {
+    HWND window{};
+    DWORD error{};
+};
+
+ConnectionWindowCreationResult CreateConnectionWindow(
+    HINSTANCE instance, HWND owner, ProcessInstanceId process, std::wstring process_name,
+    ConnectionAggregator& aggregator, ProcessInfoCache& process_cache);

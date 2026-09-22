@@ -66,6 +66,8 @@ public:
     void Stop();
 
     bool running() const noexcept;
+    bool cleanup_pending() const;
+    void ClearStatistics();
     EtwLossCounters loss_counters() const;
     std::uint64_t events_lost() const;
     std::uint64_t real_time_buffers_lost() const;
@@ -94,6 +96,7 @@ private:
 
     mutable std::mutex transition_mutex_;
     mutable std::mutex api_mutex_;
+    std::mutex statistics_mutex_;
     std::wstring session_name_;
     std::vector<std::byte> properties_buffer_;
     EVENT_TRACE_LOGFILEW log_file_{};
