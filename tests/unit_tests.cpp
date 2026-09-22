@@ -1433,6 +1433,120 @@ void TestConnectionRowsSortEveryColumnWithBinaryAndKeyTieBreakers() {
     CHECK_EQ(ties[1].connection.key, tied.key);
 }
 
+void TestConnectionFilteringMatchesEndpointsAndPreservesCallerOrder() {
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const ConnectionDisplayRow first{
+        {MakeConnectionKey({1, 1}, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls,
+                            50000, 443, MakeIpv4Address(192, 0, 2, 10),
+                            MakeIpv4Address(198, 51, 100, 2)),
+         L"first.exe", 1, 0, 0.0, 0.0, t0},
+        true,
+        ConnectionActivityStatus::Active,
+        ConnectionDirection::SendOnly};
+    const ConnectionDisplayRow second{
+        {MakeConnectionKey({2, 1}, TransportProtocol::Udp, ApplicationProtocol::Dns, 5353,
+                            53,
+                            MakeIpv6Address({0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,
+                                             0, 0, 0, 1}),
+                            MakeIpv4Address(203, 0, 113, 53)),
+         L"second.exe", 0, 1, 0.0, 0.0, t0},
+        true,
+        ConnectionActivityStatus::Historical,
+        ConnectionDirection::ReceiveOnly};
+    const ConnectionDisplayRow third{
+        {MakeConnectionKey({3, 1}, TransportProtocol::Tcp, ApplicationProtocol::Ssh, 22, 60000,
+                            MakeIpv4Address(10, 0, 0, 3),
+                            MakeIpv6Address({0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0,
+                                             0, 0, 0, 8})),
+         L"third.exe", 1, 1, 0.0, 0.0, t0},
+        true,
+        ConnectionActivityStatus::Active,
+        ConnectionDirection::Bidirectional};
+    const std::vector<ConnectionDisplayRow> rows{first, second, third};
+
+    const auto all = FilterConnectionRows(rows, {});
+    CHECK_EQ(all.size(), 3ULL);
+    if (all.size() == 3) {
+        CHECK_EQ(all[0].connection.key, first.connection.key);
+        CHECK_EQ(all[1].connection.key, second.connection.key);
+        CHECK_EQ(all[2].connection.key, third.connection.key);
+    }
+
+    const auto local_ipv4 = FilterConnectionRows(rows, {L"192.0.2", std::nullopt});
+    CHECK_EQ(local_ipv4.size(), 1ULL);
+    if (local_ipv4.size() == 1) {
+        CHECK_EQ(local_ipv4[0].connection.key, first.connection.key);
+    }
+
+    const auto remote_ipv4 = FilterConnectionRows(rows, {L"198.51.100", std::nullopt});
+    CHECK_EQ(remote_ipv4.size(), 1ULL);
+    if (remote_ipv4.size() == 1) {
+        CHECK_EQ(remote_ipv4[0].connection.key, first.connection.key);
+    }
+
+    const auto case_insensitive_ipv6 = FilterConnectionRows(rows, {L"DB8", std::nullopt});
+    CHECK_EQ(case_insensitive_ipv6.size(), 1ULL);
+    if (case_insensitive_ipv6.size() == 1) {
+        CHECK_EQ(case_insensitive_ipv6[0].connection.key, second.connection.key);
+    }
+
+    const auto both_ipv6 = FilterConnectionRows(rows, {L"2001", std::nullopt});
+    CHECK_EQ(both_ipv6.size(), 2ULL);
+    if (both_ipv6.size() == 2) {
+        CHECK_EQ(both_ipv6[0].connection.key, second.connection.key);
+        CHECK_EQ(both_ipv6[1].connection.key, third.connection.key);
+    }
+
+    const auto local_port = FilterConnectionRows(rows, {L"", 22});
+    CHECK_EQ(local_port.size(), 1ULL);
+    if (local_port.size() == 1) {
+        CHECK_EQ(local_port[0].connection.key, third.connection.key);
+    }
+
+    const auto remote_port = FilterConnectionRows(rows, {L"", 443});
+    CHECK_EQ(remote_port.size(), 1ULL);
+    if (remote_port.size() == 1) {
+        CHECK_EQ(remote_port[0].connection.key, first.connection.key);
+    }
+
+    const auto combined = FilterConnectionRows(rows, {L"db8", 5353});
+    CHECK_EQ(combined.size(), 1ULL);
+    if (combined.size() == 1) {
+        CHECK_EQ(combined[0].connection.key, second.connection.key);
+    }
+
+    const auto mismatched_combined = FilterConnectionRows(rows, {L"db8", 443});
+    CHECK_EQ(mismatched_combined.size(), 0ULL);
+}
+
+void TestPortFilterParsingUsesStrictDecimalPortRules() {
+    const PortFilterParseResult empty = ParsePortFilter(L"");
+    CHECK_EQ(empty.valid, true);
+    CHECK_EQ(empty.port.has_value(), false);
+
+    const PortFilterParseResult zero = ParsePortFilter(L"0");
+    CHECK_EQ(zero.valid, true);
+    CHECK_EQ(zero.port.has_value(), true);
+    if (zero.port.has_value()) {
+        CHECK_EQ(*zero.port, static_cast<std::uint16_t>(0));
+    }
+
+    const PortFilterParseResult maximum = ParsePortFilter(L"65535");
+    CHECK_EQ(maximum.valid, true);
+    CHECK_EQ(maximum.port.has_value(), true);
+    if (maximum.port.has_value()) {
+        CHECK_EQ(*maximum.port, static_cast<std::uint16_t>(65535));
+    }
+
+    const std::array<std::wstring_view, 8> invalid_texts{
+        L" ", L" 80", L"80 ", L"+80", L"-1", L"80x", L"\uff11", L"65536"};
+    for (const std::wstring_view text : invalid_texts) {
+        const PortFilterParseResult result = ParsePortFilter(text);
+        CHECK_EQ(result.valid, false);
+        CHECK_EQ(result.port.has_value(), false);
+    }
+}
+
 void TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically() {
     const TrafficKey slow{{300, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
     const TrafficKey fast{{200, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http};
@@ -2548,6 +2662,8 @@ int main(int argc, char** argv) {
     TestTrafficAggregationKeepsApplicationProtocolsSeparate();
     TestConnectionRowsFormatAddressesAndClassifyActivity();
     TestConnectionRowsSortEveryColumnWithBinaryAndKeyTieBreakers();
+    TestConnectionFilteringMatchesEndpointsAndPreservesCallerOrder();
+    TestPortFilterParsingUsesStrictDecimalPortRules();
     TestTrafficFormatting();
     TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically();
     TestVisibleRowsFilterWithoutMutatingSnapshotAndAttachLiveness();

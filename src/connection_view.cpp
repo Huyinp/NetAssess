@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -69,6 +70,33 @@ int CompareByColumn(const ConnectionDisplayRow& left, const ConnectionDisplayRow
     return 0;
 }
 
+bool ContainsInvariantCaseInsensitive(std::wstring_view value, std::wstring_view needle) {
+    if (needle.empty()) {
+        return true;
+    }
+    if (needle.size() > value.size()) {
+        return false;
+    }
+    for (std::size_t offset = 0; offset + needle.size() <= value.size(); ++offset) {
+        if (CompareStringOrdinal(value.data() + offset, static_cast<int>(needle.size()),
+                                 needle.data(), static_cast<int>(needle.size()), TRUE) ==
+            CSTR_EQUAL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MatchesConnectionFilter(const ConnectionDisplayRow& row, const ConnectionFilter& filter) {
+    const ConnectionKey& key = row.connection.key;
+    const bool ip_matches =
+        ContainsInvariantCaseInsensitive(FormatIpAddress(key.local.address), filter.ip) ||
+        ContainsInvariantCaseInsensitive(FormatIpAddress(key.remote.address), filter.ip);
+    const bool port_matches = !filter.port.has_value() || key.local.port == *filter.port ||
+                              key.remote.port == *filter.port;
+    return ip_matches && port_matches;
+}
+
 }  // namespace
 
 std::wstring FormatIpAddress(const IpAddress& address) {
@@ -87,6 +115,37 @@ std::wstring FormatIpAddress(const IpAddress& address) {
         }
     }
     return L"无效地址";
+}
+
+PortFilterParseResult ParsePortFilter(std::wstring_view text) {
+    if (text.empty()) {
+        return {std::nullopt, true};
+    }
+
+    std::uint32_t value = 0;
+    for (const wchar_t character : text) {
+        if (character < L'0' || character > L'9') {
+            return {std::nullopt, false};
+        }
+        const std::uint32_t digit = static_cast<std::uint32_t>(character - L'0');
+        if (value > (std::numeric_limits<std::uint16_t>::max() - digit) / 10) {
+            return {std::nullopt, false};
+        }
+        value = value * 10 + digit;
+    }
+    return {static_cast<std::uint16_t>(value), true};
+}
+
+std::vector<ConnectionDisplayRow> FilterConnectionRows(std::vector<ConnectionDisplayRow> rows,
+                                                        const ConnectionFilter& filter) {
+    std::vector<ConnectionDisplayRow> filtered;
+    filtered.reserve(rows.size());
+    for (ConnectionDisplayRow& row : rows) {
+        if (MatchesConnectionFilter(row, filter)) {
+            filtered.push_back(std::move(row));
+        }
+    }
+    return filtered;
 }
 
 std::wstring_view ConnectionActivityStatusText(ConnectionActivityStatus status) {
