@@ -2,6 +2,7 @@
 
 #include "formatting.h"
 
+#include <chrono>
 #include <functional>
 #include <map>
 #include <optional>
@@ -34,6 +35,7 @@ struct MainWindowDependencies {
     CsvSaveResult (*save_csv)(HWND, std::wstring_view,
                               std::span<const std::wstring>,
                               std::span<const std::vector<std::wstring>>){};
+    std::chrono::steady_clock::time_point (*sample_time)(){};
 };
 
 std::vector<TrafficDisplayRow> BuildVisibleRows(

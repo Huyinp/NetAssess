@@ -2198,6 +2198,18 @@ void TestMainWindowRetriesFailedStopInsteadOfStartingAnotherSession() {
     while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
 }
 
+int main_list_destroy_notifications = 0;
+
+LRESULT CALLBACK ObserveMainListDestruction(HWND list, UINT message, WPARAM wparam,
+                                            LPARAM lparam, UINT_PTR subclass_id,
+                                            DWORD_PTR) {
+    if (message == WM_NCDESTROY) {
+        ++main_list_destroy_notifications;
+        RemoveWindowSubclass(list, ObserveMainListDestruction, subclass_id);
+    }
+    return DefSubclassProc(list, message, wparam, lparam);
+}
+
 void TestMainWindowCreatesOperationalToolbarAndSortArrow() {
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
     CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
@@ -2222,7 +2234,40 @@ void TestMainWindowCreatesOperationalToolbarAndSortArrow() {
     }
     CHECK_EQ(export_button != nullptr, true);
     CHECK_EQ(list != nullptr, true);
+    MINMAXINFO limits{};
+    SendMessageW(window, WM_GETMINMAXINFO, 0, reinterpret_cast<LPARAM>(&limits));
+    CHECK_EQ(limits.ptMinTrackSize.x > 0, true);
+    CHECK_EQ(limits.ptMinTrackSize.y > 0, true);
+    RECT suggested{100, 100, 1240, 730};
+    SendMessageW(window, WM_DPICHANGED, MAKEWPARAM(144, 144),
+                 reinterpret_cast<LPARAM>(&suggested));
+    SendMessageW(window, WM_GETMINMAXINFO, 0, reinterpret_cast<LPARAM>(&limits));
+    CHECK_EQ(limits.ptMinTrackSize.x, 1140);
+    CHECK_EQ(limits.ptMinTrackSize.y, 630);
+    RECT client{};
+    GetClientRect(window, &client);
+    HWND clear_button = GetDlgItem(window, 1002);
+    HWND filter = GetDlgItem(window, 1003);
+    CHECK_EQ(clear_button != nullptr && filter != nullptr, true);
+    if (clear_button != nullptr && export_button != nullptr && filter != nullptr) {
+        RECT clear_bounds{};
+        RECT export_bounds{};
+        RECT filter_bounds{};
+        GetWindowRect(clear_button, &clear_bounds);
+        GetWindowRect(export_button, &export_bounds);
+        GetWindowRect(filter, &filter_bounds);
+        MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&clear_bounds), 2);
+        MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&export_bounds), 2);
+        MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&filter_bounds), 2);
+        CHECK_EQ(clear_bounds.right <= export_bounds.left, true);
+        CHECK_EQ(export_bounds.right <= filter_bounds.left, true);
+        CHECK_EQ(filter_bounds.right <= client.right, true);
+        CHECK_EQ(filter_bounds.right > filter_bounds.left, true);
+    }
     if (list != nullptr) {
+        CHECK_EQ(ListView_GetColumnWidth(list, 0), 285);
+        main_list_destroy_notifications = 0;
+        CHECK_EQ(SetWindowSubclass(list, ObserveMainListDestruction, 99, 0) != FALSE, true);
         HWND header = ListView_GetHeader(list);
         HDITEMW item{};
         item.mask = HDI_FORMAT;
@@ -2239,6 +2284,11 @@ void TestMainWindowCreatesOperationalToolbarAndSortArrow() {
         CHECK_EQ((item.fmt & HDF_SORTUP) != 0, true);
     }
     DestroyWindow(window);
+    CHECK_EQ(IsWindow(window), FALSE);
+    if (list != nullptr) {
+        CHECK_EQ(main_list_destroy_notifications, 1);
+        CHECK_EQ(IsWindow(list), FALSE);
+    }
     MSG message{};
     while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
 }
@@ -2255,6 +2305,39 @@ DWORD main_error_code = ERROR_SUCCESS;
 std::vector<std::wstring> main_csv_headers;
 std::vector<std::vector<std::wstring>> main_csv_rows;
 CsvSaveResult main_csv_result{false, ERROR_SUCCESS};
+std::chrono::steady_clock::time_point main_sample_time{};
+int main_sample_index = 0;
+
+std::chrono::steady_clock::time_point MainSampleTime() {
+    return main_sample_time + std::chrono::seconds(main_sample_index++);
+}
+
+TrafficAggregator* main_reorder_traffic = nullptr;
+int main_menu_refreshes = 0;
+int main_confirmation_refreshes = 0;
+int ChooseMainMenu(HWND, HMENU, POINT);
+bool ConfirmMainTerminate(HWND, std::wstring_view, ProcessInstanceId);
+
+int ChooseMainMenuAfterRefresh(HWND owner, HMENU menu, POINT point) {
+    const int command = ChooseMainMenu(owner, menu, point);
+    ++main_menu_refreshes;
+    main_reorder_traffic->Add({{{4001, 91}, TransportProtocol::Tcp,
+                                ApplicationProtocol::Http},
+                               L"aaa.exe", TrafficDirection::Send, 1});
+    SendMessageW(owner, WM_TIMER, 1, 0);
+    return command;
+}
+
+bool ConfirmMainTerminateAfterRefresh(HWND owner, std::wstring_view name,
+                                      ProcessInstanceId process) {
+    ConfirmMainTerminate(owner, name, process);
+    ++main_confirmation_refreshes;
+    main_reorder_traffic->Add({{{4002, 92}, TransportProtocol::Tcp,
+                                ApplicationProtocol::Http},
+                               L"aab.exe", TrafficDirection::Send, 1});
+    SendMessageW(owner, WM_TIMER, 1, 0);
+    return main_confirm_result;
+}
 
 int ChooseMainMenu(HWND, HMENU menu, POINT) {
     main_menu_labels.clear();
@@ -2335,9 +2418,20 @@ void TestMainWindowRoutesProcessActionsAndExportsVisibleRows() {
         CHECK_EQ(main_csv_rows.size(), 1U);
         if (main_csv_rows.size() == 1) {
             CHECK_EQ(main_csv_rows[0].size(), 9U);
-            CHECK_EQ(main_csv_rows[0][0], L"zeta.exe");
-            CHECK_EQ(main_csv_rows[0][1], L"4242");
-            CHECK_EQ(main_csv_rows[0][5], L"1 KB");
+            const std::array<std::wstring_view, 9> expected_headers{
+                L"进程名", L"PID", L"状态", L"传输层协议", L"推断应用协议",
+                L"上行累计", L"上行速度", L"下行累计", L"下行速度"};
+            const std::array<std::wstring_view, 9> expected_cells{
+                L"zeta.exe", L"4242", L"已结束", L"TCP", L"HTTPS/TLS（端口推断）",
+                L"1 KB", L"0 B/s", L"0 B", L"0 B/s"};
+            for (int column = 0; column < 9; ++column) {
+                CHECK_EQ(main_csv_headers[column], expected_headers[column]);
+                CHECK_EQ(main_csv_rows[0][column], expected_cells[column]);
+                wchar_t displayed[256]{};
+                ListView_GetItemText(list, 0, column, displayed,
+                                     static_cast<int>(std::size(displayed)));
+                CHECK_EQ(main_csv_rows[0][column], std::wstring_view(displayed));
+            }
         }
         main_csv_result = {false, ERROR_ACCESS_DENIED};
         main_error_calls = 0;
@@ -2386,6 +2480,75 @@ void TestMainWindowRoutesProcessActionsAndExportsVisibleRows() {
     while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
 }
 
+void TestMainWindowMouseActionKeepsClickedProcessAcrossMenuAndConfirmationRefresh() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    TrafficAggregator traffic;
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    FakeEtwSessionApi etw_api;
+    EtwMonitor etw(traffic, connections, cache, etw_api);
+    FakeProcessActionApi action_api;
+    action_api.creation_time_100ns = 77;
+    ProcessActions actions(action_api);
+    FakeNetworkInterfaceApi network_api;
+    NetworkRateMonitor network(network_api);
+    traffic.Add({{{4242, 77}, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls},
+                 L"zeta.exe", TrafficDirection::Send, 1});
+    traffic.Add({{{4243, 88}, TransportProtocol::Tcp, ApplicationProtocol::Http},
+                 L"mike.exe", TrafficDirection::Send, 1});
+    main_reorder_traffic = &traffic;
+    main_menu_refreshes = 0;
+    main_confirmation_refreshes = 0;
+    main_confirm_calls = 0;
+    main_confirm_result = true;
+    main_menu_command = 1007;
+    MainWindowDependencies dependencies{&actions, &network, ChooseMainMenuAfterRefresh,
+        ConfirmMainTerminateAfterRefresh, CaptureMainError, CaptureMainCsv};
+    HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections,
+                                   cache, etw, dependencies);
+    CHECK_EQ(window != nullptr, true);
+    if (window != nullptr) {
+        HWND list = FindWindowExW(window, nullptr, WC_LISTVIEWW, nullptr);
+        CHECK_EQ(list != nullptr, true);
+        if (list != nullptr) {
+            NMLISTVIEW sort_click{};
+            sort_click.hdr.hwndFrom = list;
+            sort_click.hdr.code = LVN_COLUMNCLICK;
+            sort_click.iSubItem = 0;
+            SendMessageW(window, WM_NOTIFY, 0, reinterpret_cast<LPARAM>(&sort_click));
+            wchar_t first_name[64]{};
+            wchar_t second_name[64]{};
+            ListView_GetItemText(list, 0, 0, first_name, 64);
+            ListView_GetItemText(list, 1, 0, second_name, 64);
+            CHECK_EQ(std::wstring_view(first_name), L"mike.exe");
+            CHECK_EQ(std::wstring_view(second_name), L"zeta.exe");
+            ListView_SetItemState(list, 0, LVIS_FOCUSED | LVIS_SELECTED,
+                                  LVIS_FOCUSED | LVIS_SELECTED);
+            NMITEMACTIVATE right_click{};
+            right_click.hdr.hwndFrom = list;
+            right_click.hdr.code = NM_RCLICK;
+            right_click.iItem = 1;
+            SendMessageW(window, WM_NOTIFY, 0, reinterpret_cast<LPARAM>(&right_click));
+            CHECK_EQ(main_menu_refreshes, 1);
+            CHECK_EQ(main_confirmation_refreshes, 1);
+            CHECK_EQ(main_confirm_calls, 1);
+            CHECK_EQ(main_confirm_name, L"zeta.exe");
+            CHECK_EQ(main_confirm_process.pid, 4242U);
+            CHECK_EQ(main_confirm_process.creation_time_100ns, 77ULL);
+            CHECK_EQ(action_api.open_process_calls, 1);
+            CHECK_EQ(action_api.opened_process_id, 4242UL);
+            CHECK_EQ(action_api.get_process_times_calls, 1);
+            CHECK_EQ(action_api.terminate_process_calls, 1);
+            CHECK_EQ(ListView_GetItemCount(list), 4);
+        }
+        DestroyWindow(window);
+    }
+    main_reorder_traffic = nullptr;
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
+}
+
 void TestMainWindowShowsNetworkRatesAndRecoversAfterError() {
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
     CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
@@ -2402,6 +2565,9 @@ void TestMainWindowShowsNetworkRatesAndRecoversAfterError() {
     NetworkRateMonitor network(network_api);
     MainWindowDependencies dependencies{};
     dependencies.network_rate_monitor = &network;
+    main_sample_time = std::chrono::steady_clock::now();
+    main_sample_index = 0;
+    dependencies.sample_time = MainSampleTime;
     HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections,
                                    cache, etw, dependencies);
     CHECK_EQ(window != nullptr, true);
@@ -2421,13 +2587,12 @@ void TestMainWindowShowsNetworkRatesAndRecoversAfterError() {
     SendMessageW(window, WM_COMMAND, MAKEWPARAM(1002, BN_CLICKED), 0);
     SendMessageW(window, WM_TIMER, 1, 0);
     CHECK_EQ(network_api.query_index, 2U);
-    CHECK_EQ(status_text().find(L"总网速：↑") != std::wstring::npos, true);
-    CHECK_EQ(status_text().find(L"总网速：↑ 0 B/s ↓ 0 B/s 合计 0 B/s") == std::wstring::npos, true);
+    CHECK_EQ(status_text().find(L"总网速：↑ 512 B/s ↓ 1 KB/s 合计 1.5 KB/s") != std::wstring::npos, true);
     SendMessageW(window, WM_TIMER, 1, 0);
     CHECK_EQ(status_text().find(L"总网速：不可用（错误 5）") != std::wstring::npos, true);
     SendMessageW(window, WM_TIMER, 1, 0);
     CHECK_EQ(network_api.query_index, 4U);
-    CHECK_EQ(status_text().find(L"总网速：↑") != std::wstring::npos, true);
+    CHECK_EQ(status_text().find(L"总网速：↑ 256 B/s ↓ 512 B/s 合计 768 B/s") != std::wstring::npos, true);
     DestroyWindow(window);
     MSG message{};
     while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
@@ -2478,6 +2643,25 @@ void TestMainWindowKeepsManualScrollAndResetsForSortAndFilter() {
         CHECK_EQ(std::wstring_view(restored_name), std::wstring_view(anchored_name));
         CHECK_EQ((ListView_GetItemState(list, ListView_GetTopIndex(list), LVIS_SELECTED) &
                   LVIS_SELECTED) != 0, true);
+        const int removed_top = ListView_GetTopIndex(list);
+        traffic.Clear();
+        for (int index = 0; index < 80; ++index) {
+            const std::wstring name = L"proc" + std::to_wstring(100 + index) + L".exe";
+            if (name != anchored_name) {
+                traffic.Add({{{static_cast<std::uint32_t>(5000 + index),
+                               static_cast<std::uint64_t>(100 + index)},
+                              TransportProtocol::Tcp, ApplicationProtocol::Http},
+                             name, TrafficDirection::Send, 1});
+            }
+        }
+        traffic.Add({{{4000, 999}, TransportProtocol::Tcp, ApplicationProtocol::Http},
+                     L"aaa.exe", TrafficDirection::Send, 1});
+        SendMessageW(window, WM_TIMER, 1, 0);
+        CHECK_EQ(ListView_GetItemCount(list), 80);
+        const int fallback_top = ListView_GetTopIndex(list);
+        CHECK_EQ(fallback_top >= 0 && fallback_top < ListView_GetItemCount(list), true);
+        CHECK_EQ(fallback_top >= removed_top - 1 && fallback_top <= removed_top + 1, true);
+        CHECK_EQ(ListView_GetSelectedCount(list), 0);
         NMLISTVIEW click{};
         click.hdr.hwndFrom = list;
         click.hdr.code = LVN_COLUMNCLICK;
@@ -2494,6 +2678,11 @@ void TestMainWindowKeepsManualScrollAndResetsForSortAndFilter() {
         SendMessageW(list, WM_VSCROLL, SB_PAGEDOWN, 0);
         CHECK_EQ(ListView_GetTopIndex(list) > 0, true);
         SendMessageW(list, WM_VSCROLL, SB_TOP, 0);
+        CHECK_EQ(ListView_GetTopIndex(list), 0);
+        SendMessageW(list, WM_VSCROLL, SB_PAGEDOWN, 0);
+        CHECK_EQ(ListView_GetTopIndex(list) > 0, true);
+        ListView_SetItemState(list, ListView_GetTopIndex(list), LVIS_FOCUSED, LVIS_FOCUSED);
+        SendMessageW(list, WM_KEYDOWN, VK_HOME, 0);
         CHECK_EQ(ListView_GetTopIndex(list), 0);
         traffic.Add({{{3999, 998}, TransportProtocol::Tcp, ApplicationProtocol::Http},
                      L"proc000.exe", TrafficDirection::Send, 1});
@@ -3948,6 +4137,7 @@ int main(int argc, char** argv) {
     TestMainWindowRetriesFailedStopInsteadOfStartingAnotherSession();
     TestMainWindowCreatesOperationalToolbarAndSortArrow();
     TestMainWindowRoutesProcessActionsAndExportsVisibleRows();
+    TestMainWindowMouseActionKeepsClickedProcessAcrossMenuAndConfirmationRefresh();
     TestMainWindowShowsNetworkRatesAndRecoversAfterError();
     TestMainWindowKeepsManualScrollAndResetsForSortAndFilter();
     TestConnectionCreationPreservesErrorAcrossDestruction();

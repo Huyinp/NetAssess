@@ -125,6 +125,9 @@ public:
         if (dependencies_.save_csv == nullptr) {
             dependencies_.save_csv = SaveCsvWithDialog;
         }
+        if (dependencies_.sample_time == nullptr) {
+            dependencies_.sample_time = std::chrono::steady_clock::now;
+        }
     }
 
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wparam,
@@ -204,7 +207,7 @@ private:
         case WM_TIMER:
             if (wparam == kRefreshTimerId) {
                 network_rate_snapshot_ = dependencies_.network_rate_monitor->Snapshot(
-                    std::chrono::steady_clock::now());
+                    dependencies_.sample_time());
                 RefreshSnapshot();
             }
             return 0;
