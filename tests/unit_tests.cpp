@@ -9,6 +9,7 @@
 #include "formatting.h"
 #include "main_window.h"
 #include "process_info.h"
+#include "process_actions.h"
 #include "protocol_classifier.h"
 #include "traffic_aggregator.h"
 
@@ -427,6 +428,108 @@ public:
     std::size_t creation_time_index{};
     int query_process_calls{};
     int query_creation_time_calls{};
+};
+
+class FakeProcessActionApi final : public IProcessActionApi {
+public:
+    HANDLE OpenProcess(DWORD desired_access, BOOL inherit_handle, DWORD process_id) override {
+        calls.push_back(L"open");
+        ++open_process_calls;
+        requested_access = desired_access;
+        opened_inherit_handle = inherit_handle;
+        opened_process_id = process_id;
+        return open_succeeds ? process_handle : nullptr;
+    }
+
+    BOOL GetProcessTimes(HANDLE handle, FILETIME* creation_time, FILETIME*, FILETIME*,
+                         FILETIME*) override {
+        calls.push_back(L"times");
+        ++get_process_times_calls;
+        timed_handle = handle;
+        if (!get_process_times_succeeds) {
+            return FALSE;
+        }
+        creation_time->dwLowDateTime = static_cast<DWORD>(creation_time_100ns);
+        creation_time->dwHighDateTime =
+            static_cast<DWORD>(creation_time_100ns >> 32);
+        return TRUE;
+    }
+
+    BOOL QueryFullProcessImageNameW(HANDLE handle, DWORD flags, LPWSTR path,
+                                    PDWORD path_length) override {
+        calls.push_back(L"path");
+        ++query_image_path_calls;
+        queried_path_handle = handle;
+        queried_path_flags = flags;
+        if (!query_image_path_succeeds) {
+            return FALSE;
+        }
+        if (*path_length < image_path.size()) {
+            last_error = ERROR_INSUFFICIENT_BUFFER;
+            return FALSE;
+        }
+        std::copy(image_path.begin(), image_path.end(), path);
+        *path_length = static_cast<DWORD>(image_path.size());
+        return TRUE;
+    }
+
+    BOOL ShellExecuteExW(SHELLEXECUTEINFOW* execute_info) override {
+        calls.push_back(L"shell");
+        ++shell_execute_calls;
+        shell_file = execute_info->lpFile == nullptr ? L"" : execute_info->lpFile;
+        shell_parameters =
+            execute_info->lpParameters == nullptr ? L"" : execute_info->lpParameters;
+        shell_mask = execute_info->fMask;
+        shell_show = execute_info->nShow;
+        return shell_execute_succeeds ? TRUE : FALSE;
+    }
+
+    BOOL TerminateProcess(HANDLE handle, UINT exit_code) override {
+        calls.push_back(L"terminate");
+        ++terminate_process_calls;
+        terminated_handle = handle;
+        terminate_exit_code = exit_code;
+        return terminate_process_succeeds ? TRUE : FALSE;
+    }
+
+    BOOL CloseHandle(HANDLE handle) override {
+        calls.push_back(L"close");
+        ++close_handle_calls;
+        closed_handle = handle;
+        return TRUE;
+    }
+
+    DWORD LastError() const override { return last_error; }
+
+    HANDLE process_handle = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(0x9876));
+    bool open_succeeds{true};
+    bool get_process_times_succeeds{true};
+    bool query_image_path_succeeds{true};
+    bool shell_execute_succeeds{true};
+    bool terminate_process_succeeds{true};
+    DWORD last_error{ERROR_ACCESS_DENIED};
+    std::uint64_t creation_time_100ns{77};
+    std::wstring image_path{L"C:\\Program Files\\tools,here\\app.exe"};
+    int open_process_calls{};
+    int get_process_times_calls{};
+    int query_image_path_calls{};
+    int shell_execute_calls{};
+    int terminate_process_calls{};
+    int close_handle_calls{};
+    DWORD requested_access{};
+    BOOL opened_inherit_handle{};
+    DWORD opened_process_id{};
+    HANDLE timed_handle{};
+    HANDLE queried_path_handle{};
+    DWORD queried_path_flags{};
+    HANDLE terminated_handle{};
+    UINT terminate_exit_code{};
+    HANDLE closed_handle{};
+    std::wstring shell_file;
+    std::wstring shell_parameters;
+    ULONG shell_mask{};
+    int shell_show{};
+    std::vector<std::wstring> calls;
 };
 
 class FakeNetworkInterfaceApi final : public INetworkInterfaceApi {
@@ -2756,6 +2859,191 @@ void TestDefaultNetworkRateMonitorQueriesInterfaces() {
     CHECK_EQ(snapshot.sent_bytes_per_second, 0.0);
 }
 
+void TestRevealExecutableValidatesInstanceAndSelectsQuotedPath() {
+    FakeProcessActionApi api;
+    api.creation_time_100ns = 0x1122334455667788ULL;
+    api.image_path = L"C:\\Program Files\\odd\"name,tool.exe";
+    ProcessActions actions(api);
+
+    const ProcessActionResult result =
+        actions.RevealExecutable({4242, api.creation_time_100ns});
+
+    CHECK_EQ(result.succeeded, true);
+    CHECK_EQ(result.error, static_cast<DWORD>(ERROR_SUCCESS));
+    CHECK_EQ(api.requested_access, static_cast<DWORD>(PROCESS_QUERY_LIMITED_INFORMATION));
+    CHECK_EQ(api.opened_inherit_handle, FALSE);
+    CHECK_EQ(api.opened_process_id, 4242UL);
+    CHECK_EQ(api.timed_handle, api.process_handle);
+    CHECK_EQ(api.queried_path_handle, api.process_handle);
+    CHECK_EQ(api.queried_path_flags, 0UL);
+    CHECK_EQ(api.shell_file, L"explorer.exe");
+    CHECK_EQ(api.shell_parameters,
+             L"/select,\"C:\\Program Files\\odd\\\"name,tool.exe\"");
+    CHECK_EQ(api.shell_mask, static_cast<ULONG>(SEE_MASK_FLAG_NO_UI));
+    CHECK_EQ(api.shell_show, SW_SHOWNORMAL);
+    CHECK_EQ(api.close_handle_calls, 1);
+    CHECK_EQ(api.closed_handle, api.process_handle);
+    CHECK_EQ(api.calls.size(), 5U);
+    CHECK_EQ(api.calls[0], L"open");
+    CHECK_EQ(api.calls[1], L"times");
+    CHECK_EQ(api.calls[2], L"path");
+    CHECK_EQ(api.calls[3], L"shell");
+    CHECK_EQ(api.calls[4], L"close");
+}
+
+void TestRevealExecutableRejectsReusedPidBeforePathOrShellAction() {
+    FakeProcessActionApi api;
+    api.creation_time_100ns = 91;
+    ProcessActions actions(api);
+
+    const ProcessActionResult result = actions.RevealExecutable({4242, 92});
+
+    CHECK_EQ(result.succeeded, false);
+    CHECK_EQ(result.error, static_cast<DWORD>(ERROR_NOT_FOUND));
+    CHECK_EQ(api.query_image_path_calls, 0);
+    CHECK_EQ(api.shell_execute_calls, 0);
+    CHECK_EQ(api.terminate_process_calls, 0);
+    CHECK_EQ(api.close_handle_calls, 1);
+    CHECK_EQ(api.calls.size(), 3U);
+    CHECK_EQ(api.calls[0], L"open");
+    CHECK_EQ(api.calls[1], L"times");
+    CHECK_EQ(api.calls[2], L"close");
+}
+
+void TestRevealExecutablePropagatesBoundaryFailures() {
+    {
+        FakeProcessActionApi api;
+        api.open_succeeds = false;
+        api.last_error = ERROR_FILE_NOT_FOUND;
+        ProcessActions actions(api);
+        const ProcessActionResult result = actions.RevealExecutable({42, 77});
+        CHECK_EQ(result.succeeded, false);
+        CHECK_EQ(result.error, static_cast<DWORD>(ERROR_FILE_NOT_FOUND));
+        CHECK_EQ(api.close_handle_calls, 0);
+    }
+    {
+        FakeProcessActionApi api;
+        api.get_process_times_succeeds = false;
+        api.last_error = ERROR_ACCESS_DENIED;
+        ProcessActions actions(api);
+        const ProcessActionResult result = actions.RevealExecutable({42, 77});
+        CHECK_EQ(result.succeeded, false);
+        CHECK_EQ(result.error, static_cast<DWORD>(ERROR_ACCESS_DENIED));
+        CHECK_EQ(api.query_image_path_calls, 0);
+        CHECK_EQ(api.close_handle_calls, 1);
+    }
+    {
+        FakeProcessActionApi api;
+        api.query_image_path_succeeds = false;
+        api.last_error = ERROR_PATH_NOT_FOUND;
+        ProcessActions actions(api);
+        const ProcessActionResult result = actions.RevealExecutable({42, 77});
+        CHECK_EQ(result.succeeded, false);
+        CHECK_EQ(result.error, static_cast<DWORD>(ERROR_PATH_NOT_FOUND));
+        CHECK_EQ(api.shell_execute_calls, 0);
+        CHECK_EQ(api.close_handle_calls, 1);
+    }
+    {
+        FakeProcessActionApi api;
+        api.shell_execute_succeeds = false;
+        api.last_error = ERROR_CANCELLED;
+        ProcessActions actions(api);
+        const ProcessActionResult result = actions.RevealExecutable({42, 77});
+        CHECK_EQ(result.succeeded, false);
+        CHECK_EQ(result.error, static_cast<DWORD>(ERROR_CANCELLED));
+        CHECK_EQ(api.close_handle_calls, 1);
+    }
+    {
+        FakeProcessActionApi api;
+        api.shell_execute_succeeds = false;
+        api.last_error = ERROR_SUCCESS;
+        ProcessActions actions(api);
+        const ProcessActionResult result = actions.RevealExecutable({42, 77});
+        CHECK_EQ(result.succeeded, false);
+        CHECK_EQ(result.error, static_cast<DWORD>(ERROR_GEN_FAILURE));
+    }
+}
+
+void TestTerminateValidatesInstanceWithOnlyRequiredRights() {
+    FakeProcessActionApi api;
+    api.creation_time_100ns = 77;
+    ProcessActions actions(api);
+
+    const ProcessActionResult result = actions.Terminate({4242, 77});
+
+    CHECK_EQ(result.succeeded, true);
+    CHECK_EQ(result.error, static_cast<DWORD>(ERROR_SUCCESS));
+    CHECK_EQ(api.requested_access,
+             static_cast<DWORD>(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE));
+    CHECK_EQ(api.opened_inherit_handle, FALSE);
+    CHECK_EQ(api.opened_process_id, 4242UL);
+    CHECK_EQ(api.get_process_times_calls, 1);
+    CHECK_EQ(api.terminate_process_calls, 1);
+    CHECK_EQ(api.terminated_handle, api.process_handle);
+    CHECK_EQ(api.terminate_exit_code, 1U);
+    CHECK_EQ(api.close_handle_calls, 1);
+    CHECK_EQ(api.calls.size(), 4U);
+    CHECK_EQ(api.calls[0], L"open");
+    CHECK_EQ(api.calls[1], L"times");
+    CHECK_EQ(api.calls[2], L"terminate");
+    CHECK_EQ(api.calls[3], L"close");
+}
+
+void TestTerminateRejectsReusedPidWithoutTerminating() {
+    FakeProcessActionApi api;
+    api.creation_time_100ns = 91;
+    ProcessActions actions(api);
+
+    const ProcessActionResult result = actions.Terminate({4242, 92});
+
+    CHECK_EQ(result.succeeded, false);
+    CHECK_EQ(result.error, static_cast<DWORD>(ERROR_NOT_FOUND));
+    CHECK_EQ(api.terminate_process_calls, 0);
+    CHECK_EQ(api.close_handle_calls, 1);
+}
+
+void TestTerminatePropagatesBoundaryFailures() {
+    {
+        FakeProcessActionApi api;
+        api.open_succeeds = false;
+        api.last_error = ERROR_ACCESS_DENIED;
+        ProcessActions actions(api);
+        const ProcessActionResult result = actions.Terminate({42, 77});
+        CHECK_EQ(result.succeeded, false);
+        CHECK_EQ(result.error, static_cast<DWORD>(ERROR_ACCESS_DENIED));
+    }
+    {
+        FakeProcessActionApi api;
+        api.get_process_times_succeeds = false;
+        api.last_error = ERROR_INVALID_HANDLE;
+        ProcessActions actions(api);
+        const ProcessActionResult result = actions.Terminate({42, 77});
+        CHECK_EQ(result.succeeded, false);
+        CHECK_EQ(result.error, static_cast<DWORD>(ERROR_INVALID_HANDLE));
+        CHECK_EQ(api.terminate_process_calls, 0);
+        CHECK_EQ(api.close_handle_calls, 1);
+    }
+    {
+        FakeProcessActionApi api;
+        api.terminate_process_succeeds = false;
+        api.last_error = ERROR_ACCESS_DENIED;
+        ProcessActions actions(api);
+        const ProcessActionResult result = actions.Terminate({42, 77});
+        CHECK_EQ(result.succeeded, false);
+        CHECK_EQ(result.error, static_cast<DWORD>(ERROR_ACCESS_DENIED));
+        CHECK_EQ(api.close_handle_calls, 1);
+    }
+    {
+        FakeProcessActionApi api;
+        api.terminate_process_succeeds = false;
+        api.last_error = ERROR_SUCCESS;
+        ProcessActions actions(api);
+        const ProcessActionResult result = actions.Terminate({42, 77});
+        CHECK_EQ(result.succeeded, false);
+        CHECK_EQ(result.error, static_cast<DWORD>(ERROR_GEN_FAILURE));
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2863,6 +3151,12 @@ int main(int argc, char** argv) {
     TestNetworkRatesKeepLastValidBaselineForRollbackAndInvalidTimes();
     TestNetworkRatesPreserveBaselinesAcrossApiFailures();
     TestDefaultNetworkRateMonitorQueriesInterfaces();
+    TestRevealExecutableValidatesInstanceAndSelectsQuotedPath();
+    TestRevealExecutableRejectsReusedPidBeforePathOrShellAction();
+    TestRevealExecutablePropagatesBoundaryFailures();
+    TestTerminateValidatesInstanceWithOnlyRequiredRights();
+    TestTerminateRejectsReusedPidWithoutTerminating();
+    TestTerminatePropagatesBoundaryFailures();
 
     return failures == 0 ? 0 : 1;
 }
