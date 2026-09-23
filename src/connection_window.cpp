@@ -116,7 +116,8 @@ private:
             SetLastError(ERROR_SUCCESS);
             if (!CreateControls()) {
                 auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
-                static_cast<CreationContext*>(create->lpCreateParams)->error = CreationError();
+                static_cast<CreationContext*>(create->lpCreateParams)->error =
+                    creation_error_ != ERROR_SUCCESS ? creation_error_ : CreationError();
                 return -1;
             }
             aggregator_.ResetSnapshotBaseline(process_);
@@ -219,8 +220,10 @@ private:
             SendMessageW(control, WM_SETFONT,
                          reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
         }
+        SetLastError(ERROR_SUCCESS);
         if (!SetWindowSubclass(list_view_, ListProcedure, 1,
                                reinterpret_cast<DWORD_PTR>(this))) {
+            creation_error_ = CreationError();
             return false;
         }
         UpdateColumnWidths();
@@ -511,6 +514,7 @@ private:
     ConnectionFilter filter_;
     ListScrollState scroll_state_;
     bool invalid_port_reported_{};
+    DWORD creation_error_{};
     UINT dpi_{win32_dpi::kDefaultDpi};
     ConnectionSortColumn sort_column_{ConnectionSortColumn::CombinedSpeed};
     bool ascending_{};
