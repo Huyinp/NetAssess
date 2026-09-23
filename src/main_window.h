@@ -21,6 +21,20 @@ class EtwMonitor;
 class ConnectionAggregator;
 class ProcessInfoCache;
 class TrafficAggregator;
+class ProcessActions;
+class NetworkRateMonitor;
+struct CsvSaveResult;
+
+struct MainWindowDependencies {
+    ProcessActions* process_actions{};
+    NetworkRateMonitor* network_rate_monitor{};
+    int (*choose_menu_command)(HWND, HMENU, POINT){};
+    bool (*confirm_termination)(HWND, std::wstring_view, ProcessInstanceId){};
+    void (*present_error)(HWND, std::wstring_view, DWORD){};
+    CsvSaveResult (*save_csv)(HWND, std::wstring_view,
+                              std::span<const std::wstring>,
+                              std::span<const std::vector<std::wstring>>){};
+};
 
 std::vector<TrafficDisplayRow> BuildVisibleRows(
     const std::vector<TrafficSnapshot>& snapshots, std::wstring_view filter,
@@ -36,4 +50,8 @@ std::map<ProcessInstanceId, HWND> TakeConnectionWindows(
 HWND CreateMainWindow(HINSTANCE instance, TrafficAggregator& aggregator,
                       ConnectionAggregator& connection_aggregator,
                       ProcessInfoCache& process_cache, EtwMonitor& monitor);
+HWND CreateMainWindow(HINSTANCE instance, TrafficAggregator& aggregator,
+                      ConnectionAggregator& connection_aggregator,
+                      ProcessInfoCache& process_cache, EtwMonitor& monitor,
+                      MainWindowDependencies dependencies);
 bool StartMainWindowCollection(HWND window);

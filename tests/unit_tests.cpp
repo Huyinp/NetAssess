@@ -2198,6 +2198,313 @@ void TestMainWindowRetriesFailedStopInsteadOfStartingAnotherSession() {
     while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
 }
 
+void TestMainWindowCreatesOperationalToolbarAndSortArrow() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    TrafficAggregator traffic;
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    FakeEtwSessionApi api;
+    EtwMonitor monitor(traffic, connections, cache, api);
+    HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections, cache, monitor);
+    CHECK_EQ(window != nullptr, true);
+    if (window == nullptr) { return; }
+    HWND export_button = nullptr;
+    HWND list = nullptr;
+    for (HWND child = GetWindow(window, GW_CHILD); child != nullptr;
+         child = GetWindow(child, GW_HWNDNEXT)) {
+        wchar_t title[32]{};
+        wchar_t class_name[32]{};
+        GetWindowTextW(child, title, static_cast<int>(std::size(title)));
+        GetClassNameW(child, class_name, static_cast<int>(std::size(class_name)));
+        if (std::wstring_view(title) == L"导出 CSV") { export_button = child; }
+        if (std::wstring_view(class_name) == WC_LISTVIEWW) { list = child; }
+    }
+    CHECK_EQ(export_button != nullptr, true);
+    CHECK_EQ(list != nullptr, true);
+    if (list != nullptr) {
+        HWND header = ListView_GetHeader(list);
+        HDITEMW item{};
+        item.mask = HDI_FORMAT;
+        for (int column = 0; column < 9; ++column) {
+            CHECK_EQ(Header_GetItem(header, column, &item) != FALSE, true);
+            CHECK_EQ((item.fmt & (HDF_SORTUP | HDF_SORTDOWN)) == 0, true);
+        }
+        NMLISTVIEW click{};
+        click.hdr.hwndFrom = list;
+        click.hdr.code = LVN_COLUMNCLICK;
+        click.iSubItem = 1;
+        SendMessageW(window, WM_NOTIFY, 0, reinterpret_cast<LPARAM>(&click));
+        CHECK_EQ(Header_GetItem(header, 1, &item) != FALSE, true);
+        CHECK_EQ((item.fmt & HDF_SORTUP) != 0, true);
+    }
+    DestroyWindow(window);
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
+}
+
+int main_menu_command = 0;
+std::vector<std::wstring> main_menu_labels;
+bool main_confirm_result = false;
+int main_confirm_calls = 0;
+std::wstring main_confirm_name;
+ProcessInstanceId main_confirm_process;
+int main_error_calls = 0;
+std::wstring main_error_action;
+DWORD main_error_code = ERROR_SUCCESS;
+std::vector<std::wstring> main_csv_headers;
+std::vector<std::vector<std::wstring>> main_csv_rows;
+CsvSaveResult main_csv_result{false, ERROR_SUCCESS};
+
+int ChooseMainMenu(HWND, HMENU menu, POINT) {
+    main_menu_labels.clear();
+    for (int index = 0; index < GetMenuItemCount(menu); ++index) {
+        wchar_t text[64]{};
+        GetMenuStringW(menu, index, text, static_cast<int>(std::size(text)), MF_BYPOSITION);
+        main_menu_labels.emplace_back(text);
+    }
+    return main_menu_command;
+}
+
+bool ConfirmMainTerminate(HWND, std::wstring_view name, ProcessInstanceId process) {
+    ++main_confirm_calls;
+    main_confirm_name = name;
+    main_confirm_process = process;
+    return main_confirm_result;
+}
+
+void CaptureMainError(HWND, std::wstring_view action, DWORD code) {
+    ++main_error_calls;
+    main_error_action = action;
+    main_error_code = code;
+}
+
+CsvSaveResult CaptureMainCsv(HWND, std::wstring_view,
+                             std::span<const std::wstring> headers,
+                             std::span<const std::vector<std::wstring>> rows) {
+    main_csv_headers.assign(headers.begin(), headers.end());
+    main_csv_rows.assign(rows.begin(), rows.end());
+    return main_csv_result;
+}
+
+void TestMainWindowRoutesProcessActionsAndExportsVisibleRows() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    TrafficAggregator traffic;
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    FakeEtwSessionApi etw_api;
+    EtwMonitor etw(traffic, connections, cache, etw_api);
+    FakeProcessActionApi action_api;
+    action_api.creation_time_100ns = 77;
+    ProcessActions actions(action_api);
+    FakeNetworkInterfaceApi network_api;
+    NetworkRateMonitor network(network_api);
+    traffic.Add({{{4242, 77}, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls},
+                 L"zeta.exe", TrafficDirection::Send, 1024});
+    traffic.Add({{{4243, 88}, TransportProtocol::Udp, ApplicationProtocol::Dns},
+                 L"alpha.exe", TrafficDirection::Receive, 2048});
+    MainWindowDependencies dependencies{&actions, &network, ChooseMainMenu,
+        ConfirmMainTerminate, CaptureMainError, CaptureMainCsv};
+    HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections,
+                                   cache, etw, dependencies);
+    CHECK_EQ(window != nullptr, true);
+    if (window == nullptr) { return; }
+    HWND list = FindWindowExW(window, nullptr, WC_LISTVIEWW, nullptr);
+    CHECK_EQ(list != nullptr, true);
+    HWND filter = GetDlgItem(window, 1003);
+    CHECK_EQ(filter != nullptr, true);
+    if (list != nullptr && filter != nullptr) {
+        NMLISTVIEW sort_click{};
+        sort_click.hdr.hwndFrom = list;
+        sort_click.hdr.code = LVN_COLUMNCLICK;
+        sort_click.iSubItem = 0;
+        SendMessageW(window, WM_NOTIFY, 0, reinterpret_cast<LPARAM>(&sort_click));
+        SendMessageW(window, WM_COMMAND, MAKEWPARAM(1005, BN_CLICKED), 0);
+        CHECK_EQ(main_csv_rows.size(), 2U);
+        if (main_csv_rows.size() == 2) {
+            CHECK_EQ(main_csv_rows[0][0], L"alpha.exe");
+            CHECK_EQ(main_csv_rows[1][0], L"zeta.exe");
+        }
+        SetWindowTextW(filter, L"zeta");
+        CHECK_EQ(ListView_GetItemCount(list), 1);
+        main_csv_headers.clear();
+        main_csv_rows.clear();
+        SendMessageW(window, WM_COMMAND, MAKEWPARAM(1005, BN_CLICKED), 0);
+        CHECK_EQ(main_csv_headers.size(), 9U);
+        CHECK_EQ(main_csv_rows.size(), 1U);
+        if (main_csv_rows.size() == 1) {
+            CHECK_EQ(main_csv_rows[0].size(), 9U);
+            CHECK_EQ(main_csv_rows[0][0], L"zeta.exe");
+            CHECK_EQ(main_csv_rows[0][1], L"4242");
+            CHECK_EQ(main_csv_rows[0][5], L"1 KB");
+        }
+        main_csv_result = {false, ERROR_ACCESS_DENIED};
+        main_error_calls = 0;
+        SendMessageW(window, WM_COMMAND, MAKEWPARAM(1005, BN_CLICKED), 0);
+        CHECK_EQ(main_error_calls, 1);
+        CHECK_EQ(main_error_action, L"导出 CSV 失败");
+        CHECK_EQ(main_error_code, static_cast<DWORD>(ERROR_ACCESS_DENIED));
+        main_csv_result = {false, ERROR_SUCCESS};
+        SendMessageW(window, WM_COMMAND, MAKEWPARAM(1005, BN_CLICKED), 0);
+        CHECK_EQ(main_error_calls, 1);
+        ListView_SetItemState(list, 0, LVIS_FOCUSED | LVIS_SELECTED,
+                              LVIS_FOCUSED | LVIS_SELECTED);
+        main_menu_command = 1006;
+        main_error_calls = 0;
+        action_api.open_succeeds = false;
+        action_api.last_error = ERROR_ACCESS_DENIED;
+        SendMessageW(window, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(list), -1);
+        CHECK_EQ(main_menu_labels ==
+            (std::vector<std::wstring>{L"查看连接明细", L"打开文件所在位置", L"结束进程"}), true);
+        CHECK_EQ(action_api.opened_process_id, 4242UL);
+        CHECK_EQ(main_error_calls, 1);
+        CHECK_EQ(main_error_action, L"打开文件所在位置");
+        CHECK_EQ(main_error_code, static_cast<DWORD>(ERROR_ACCESS_DENIED));
+        main_menu_command = 1007;
+        main_confirm_calls = 0;
+        main_confirm_result = false;
+        action_api.open_succeeds = true;
+        SendMessageW(window, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(list), -1);
+        CHECK_EQ(main_confirm_calls, 1);
+        CHECK_EQ(main_confirm_name, L"zeta.exe");
+        CHECK_EQ(main_confirm_process.pid, 4242U);
+        CHECK_EQ(main_confirm_process.creation_time_100ns, 77ULL);
+        CHECK_EQ(action_api.terminate_process_calls, 0);
+        main_confirm_result = true;
+        SendMessageW(window, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(list), -1);
+        CHECK_EQ(action_api.terminate_process_calls, 1);
+        action_api.terminate_process_succeeds = false;
+        action_api.last_error = ERROR_INVALID_HANDLE;
+        SendMessageW(window, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(list), -1);
+        CHECK_EQ(action_api.terminate_process_calls, 2);
+        CHECK_EQ(main_error_action, L"结束进程");
+        CHECK_EQ(main_error_code, static_cast<DWORD>(ERROR_INVALID_HANDLE));
+    }
+    DestroyWindow(window);
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
+}
+
+void TestMainWindowShowsNetworkRatesAndRecoversAfterError() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    TrafficAggregator traffic;
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    FakeEtwSessionApi etw_api;
+    EtwMonitor etw(traffic, connections, cache, etw_api);
+    FakeNetworkInterfaceApi network_api;
+    network_api.results = {{ERROR_SUCCESS, {MakeNetworkInterface(1, 1000, 2000)}},
+                           {ERROR_SUCCESS, {MakeNetworkInterface(1, 2024, 2512)}},
+                           {ERROR_ACCESS_DENIED, {}},
+                           {ERROR_SUCCESS, {MakeNetworkInterface(1, 3048, 3024)}}};
+    NetworkRateMonitor network(network_api);
+    MainWindowDependencies dependencies{};
+    dependencies.network_rate_monitor = &network;
+    HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections,
+                                   cache, etw, dependencies);
+    CHECK_EQ(window != nullptr, true);
+    if (window == nullptr) { return; }
+    HWND status = FindWindowExW(window, nullptr, STATUSCLASSNAMEW, nullptr);
+    CHECK_EQ(status != nullptr, true);
+    auto status_text = [&]() {
+        std::wstring value(512, L'\0');
+        SendMessageW(status, SB_GETTEXTW, 0, reinterpret_cast<LPARAM>(value.data()));
+        value.resize(std::wcslen(value.c_str()));
+        return value;
+    };
+    CHECK_EQ(network_api.query_index, 0U);
+    SendMessageW(window, WM_TIMER, 1, 0);
+    CHECK_EQ(network_api.query_index, 1U);
+    CHECK_EQ(status_text().find(L"总网速：↑ 0 B/s ↓ 0 B/s 合计 0 B/s") != std::wstring::npos, true);
+    SendMessageW(window, WM_COMMAND, MAKEWPARAM(1002, BN_CLICKED), 0);
+    SendMessageW(window, WM_TIMER, 1, 0);
+    CHECK_EQ(network_api.query_index, 2U);
+    CHECK_EQ(status_text().find(L"总网速：↑") != std::wstring::npos, true);
+    CHECK_EQ(status_text().find(L"总网速：↑ 0 B/s ↓ 0 B/s 合计 0 B/s") == std::wstring::npos, true);
+    SendMessageW(window, WM_TIMER, 1, 0);
+    CHECK_EQ(status_text().find(L"总网速：不可用（错误 5）") != std::wstring::npos, true);
+    SendMessageW(window, WM_TIMER, 1, 0);
+    CHECK_EQ(network_api.query_index, 4U);
+    CHECK_EQ(status_text().find(L"总网速：↑") != std::wstring::npos, true);
+    DestroyWindow(window);
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
+}
+
+void TestMainWindowKeepsManualScrollAndResetsForSortAndFilter() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    TrafficAggregator traffic;
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    FakeEtwSessionApi etw_api;
+    EtwMonitor etw(traffic, connections, cache, etw_api);
+    FakeNetworkInterfaceApi network_api;
+    NetworkRateMonitor network(network_api);
+    for (int index = 0; index < 80; ++index) {
+        traffic.Add({{{static_cast<std::uint32_t>(5000 + index),
+                       static_cast<std::uint64_t>(100 + index)},
+                      TransportProtocol::Tcp, ApplicationProtocol::Http},
+                     L"proc" + std::to_wstring(100 + index) + L".exe",
+                     TrafficDirection::Send, 1});
+    }
+    MainWindowDependencies dependencies{};
+    dependencies.network_rate_monitor = &network;
+    HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections,
+                                   cache, etw, dependencies);
+    CHECK_EQ(window != nullptr, true);
+    if (window == nullptr) { return; }
+    SetWindowPos(window, nullptr, 0, 0, 900, 240,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    HWND list = FindWindowExW(window, nullptr, WC_LISTVIEWW, nullptr);
+    CHECK_EQ(list != nullptr, true);
+    if (list != nullptr) {
+        CHECK_EQ(ListView_GetItemCount(list), 80);
+        SendMessageW(list, WM_VSCROLL, SB_PAGEDOWN, 0);
+        const int old_top = ListView_GetTopIndex(list);
+        CHECK_EQ(old_top > 0, true);
+        wchar_t anchored_name[64]{};
+        ListView_GetItemText(list, old_top, 0, anchored_name,
+                             static_cast<int>(std::size(anchored_name)));
+        ListView_SetItemState(list, old_top, LVIS_SELECTED, LVIS_SELECTED);
+        traffic.Add({{{4000, 999}, TransportProtocol::Tcp, ApplicationProtocol::Http},
+                     L"aaa.exe", TrafficDirection::Send, 1});
+        SendMessageW(window, WM_TIMER, 1, 0);
+        wchar_t restored_name[64]{};
+        ListView_GetItemText(list, ListView_GetTopIndex(list), 0, restored_name,
+                             static_cast<int>(std::size(restored_name)));
+        CHECK_EQ(std::wstring_view(restored_name), std::wstring_view(anchored_name));
+        CHECK_EQ((ListView_GetItemState(list, ListView_GetTopIndex(list), LVIS_SELECTED) &
+                  LVIS_SELECTED) != 0, true);
+        NMLISTVIEW click{};
+        click.hdr.hwndFrom = list;
+        click.hdr.code = LVN_COLUMNCLICK;
+        click.iSubItem = 0;
+        SendMessageW(window, WM_NOTIFY, 0, reinterpret_cast<LPARAM>(&click));
+        CHECK_EQ(ListView_GetTopIndex(list), 0);
+        SendMessageW(list, WM_MOUSEWHEEL,
+                     MAKEWPARAM(0, static_cast<WORD>(-WHEEL_DELTA)), 0);
+        CHECK_EQ(ListView_GetTopIndex(list) > 0, true);
+        HWND filter = GetDlgItem(window, 1003);
+        CHECK_EQ(filter != nullptr, true);
+        if (filter != nullptr) { SetWindowTextW(filter, L"proc"); }
+        CHECK_EQ(ListView_GetTopIndex(list), 0);
+        SendMessageW(list, WM_VSCROLL, SB_PAGEDOWN, 0);
+        CHECK_EQ(ListView_GetTopIndex(list) > 0, true);
+        SendMessageW(list, WM_VSCROLL, SB_TOP, 0);
+        CHECK_EQ(ListView_GetTopIndex(list), 0);
+        traffic.Add({{{3999, 998}, TransportProtocol::Tcp, ApplicationProtocol::Http},
+                     L"proc000.exe", TrafficDirection::Send, 1});
+        SendMessageW(window, WM_TIMER, 1, 0);
+        CHECK_EQ(ListView_GetTopIndex(list), 0);
+    }
+    DestroyWindow(window);
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
+}
+
 thread_local WNDPROC original_detail_list_procedure{};
 
 LRESULT CALLBACK FailDetailColumnProcedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -3639,6 +3946,10 @@ int main(int argc, char** argv) {
     TestEtwMonitorStopPublishesStateOnlyAfterTransitionLock();
     TestEtwMonitorBadLengthStopReleasesOwnershipButRetainsValidCounters();
     TestMainWindowRetriesFailedStopInsteadOfStartingAnotherSession();
+    TestMainWindowCreatesOperationalToolbarAndSortArrow();
+    TestMainWindowRoutesProcessActionsAndExportsVisibleRows();
+    TestMainWindowShowsNetworkRatesAndRecoversAfterError();
+    TestMainWindowKeepsManualScrollAndResetsForSortAndFilter();
     TestConnectionCreationPreservesErrorAcrossDestruction();
     TestConnectionCreationDoesNotUseStaleSubclassFailureError();
     TestConnectionWindowCreatesFilterAndExportToolbar();
