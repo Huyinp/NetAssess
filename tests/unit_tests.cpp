@@ -2248,6 +2248,232 @@ void TestConnectionCreationPreservesErrorAcrossDestruction() {
     if (created.window != nullptr) { DestroyWindow(created.window); }
 }
 
+void TestConnectionWindowCreatesFilterAndExportToolbar() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    const auto created = CreateConnectionWindow(GetModuleHandleW(nullptr), nullptr,
+        {42, 100}, L"test.exe", connections, cache);
+    CHECK_EQ(created.window != nullptr, true);
+    if (created.window == nullptr) { return; }
+
+    int edit_count = 0;
+    bool has_export_button = false;
+    HWND list = nullptr;
+    for (HWND child = GetWindow(created.window, GW_CHILD); child != nullptr;
+         child = GetWindow(child, GW_HWNDNEXT)) {
+        wchar_t class_name[32]{};
+        wchar_t title[32]{};
+        GetClassNameW(child, class_name, static_cast<int>(std::size(class_name)));
+        GetWindowTextW(child, title, static_cast<int>(std::size(title)));
+        if (std::wstring_view(class_name) == L"Edit") { ++edit_count; }
+        if (std::wstring_view(class_name) == L"Button" &&
+            std::wstring_view(title) == L"导出 CSV") { has_export_button = true; }
+        if (std::wstring_view(class_name) == WC_LISTVIEWW) { list = child; }
+    }
+    CHECK_EQ(edit_count, 2);
+    CHECK_EQ(has_export_button, true);
+    CHECK_EQ(list != nullptr, true);
+    SetWindowPos(created.window, nullptr, 0, 0, 900, 240,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    RECT client{};
+    GetClientRect(created.window, &client);
+    for (HWND child = GetWindow(created.window, GW_CHILD); child != nullptr;
+         child = GetWindow(child, GW_HWNDNEXT)) {
+        RECT bounds{};
+        GetWindowRect(child, &bounds);
+        MapWindowPoints(nullptr, created.window,
+                        reinterpret_cast<POINT*>(&bounds), 2);
+        CHECK_EQ(bounds.left >= 0 && bounds.top >= 0 &&
+                 bounds.right <= client.right && bounds.bottom <= client.bottom, true);
+    }
+    if (list != nullptr) {
+        RECT list_rect{};
+        GetWindowRect(list, &list_rect);
+        MapWindowPoints(nullptr, created.window,
+                        reinterpret_cast<POINT*>(&list_rect), 2);
+        CHECK_EQ(list_rect.top > 30, true);
+    }
+    DestroyWindow(created.window);
+}
+
+int detail_error_count = 0;
+DWORD detail_error_code = ERROR_SUCCESS;
+std::wstring detail_error_operation;
+
+void CaptureDetailError(HWND, std::wstring_view operation, DWORD code) {
+    ++detail_error_count;
+    detail_error_code = code;
+    detail_error_operation = operation;
+}
+
+void TestConnectionWindowFiltersBothEndpointsAndPreservesValidPort() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    const ProcessInstanceId process{42, 100};
+    const auto now = std::chrono::steady_clock::now();
+    connections.Add({MakeConnectionKey(process, TransportProtocol::Tcp,
+        ApplicationProtocol::HttpsTls, 50000, 443), L"test.exe",
+        TrafficDirection::Send, 128, now});
+    connections.Add({MakeConnectionKey(process, TransportProtocol::Tcp,
+        ApplicationProtocol::HttpsTls, 50001, 80,
+        MakeIpv4Address(10, 0, 0, 2), MakeIpv4Address(1, 1, 1, 1)),
+        L"test.exe", TrafficDirection::Send, 64, now});
+    const auto created = CreateConnectionWindow(GetModuleHandleW(nullptr), nullptr,
+        process, L"test.exe", connections, cache, CaptureDetailError);
+    CHECK_EQ(created.window != nullptr, true);
+    if (created.window == nullptr) { return; }
+    HWND edits[2]{};
+    int edit_count = 0;
+    HWND list = nullptr;
+    for (HWND child = GetWindow(created.window, GW_CHILD); child != nullptr;
+         child = GetWindow(child, GW_HWNDNEXT)) {
+        wchar_t class_name[32]{};
+        GetClassNameW(child, class_name, static_cast<int>(std::size(class_name)));
+        if (std::wstring_view(class_name) == L"Edit") {
+            ++edit_count;
+            if (GetDlgCtrlID(child) == 102) { edits[0] = child; }
+            if (GetDlgCtrlID(child) == 101) { edits[1] = child; }
+        }
+        if (std::wstring_view(class_name) == WC_LISTVIEWW) { list = child; }
+    }
+    if (edit_count == 2 && edits[0] != nullptr && edits[1] != nullptr &&
+        list != nullptr) {
+        SendMessageW(created.window, kConnectionWindowRefreshMessage, 0, 0);
+        CHECK_EQ(ListView_GetItemCount(list), 2);
+        SetWindowTextW(edits[0], L"1.1.1.1");
+        CHECK_EQ(ListView_GetItemCount(list), 1);
+        SetWindowTextW(edits[1], L"80");
+        CHECK_EQ(ListView_GetItemCount(list), 1);
+        detail_error_count = 0;
+        SetWindowTextW(edits[1], L"invalid");
+        CHECK_EQ(ListView_GetItemCount(list), 1);
+        CHECK_EQ(detail_error_count, 1);
+        CHECK_EQ(detail_error_code, static_cast<DWORD>(ERROR_INVALID_DATA));
+        CHECK_EQ(detail_error_operation.find(L"端口") != std::wstring::npos, true);
+        SetWindowTextW(edits[1], L"still invalid");
+        CHECK_EQ(detail_error_count, 1);
+        SetWindowTextW(edits[1], L"443");
+        CHECK_EQ(ListView_GetItemCount(list), 0);
+        SetWindowTextW(edits[1], L"");
+        CHECK_EQ(ListView_GetItemCount(list), 1);
+    }
+    DestroyWindow(created.window);
+}
+
+void TestConnectionWindowColumnClickMarksHeaderAndResetsTop() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    const auto created = CreateConnectionWindow(GetModuleHandleW(nullptr), nullptr,
+        {42, 100}, L"test.exe", connections, cache);
+    CHECK_EQ(created.window != nullptr, true);
+    if (created.window == nullptr) { return; }
+    HWND list = FindWindowExW(created.window, nullptr, WC_LISTVIEWW, nullptr);
+    CHECK_EQ(list != nullptr, true);
+    if (list != nullptr) {
+        HWND header = ListView_GetHeader(list);
+        HDITEMW item{};
+        item.mask = HDI_FORMAT;
+        CHECK_EQ(Header_GetItem(header, 0, &item) != FALSE, true);
+        CHECK_EQ((item.fmt & (HDF_SORTUP | HDF_SORTDOWN)) == 0, true);
+        NMLISTVIEW click{};
+        click.hdr.hwndFrom = list;
+        click.hdr.code = LVN_COLUMNCLICK;
+        click.iSubItem = 5;
+        SendMessageW(created.window, WM_NOTIFY, 0, reinterpret_cast<LPARAM>(&click));
+        CHECK_EQ(Header_GetItem(header, 5, &item) != FALSE, true);
+        CHECK_EQ((item.fmt & HDF_SORTUP) != 0, true);
+        SendMessageW(created.window, WM_NOTIFY, 0, reinterpret_cast<LPARAM>(&click));
+        CHECK_EQ(Header_GetItem(header, 5, &item) != FALSE, true);
+        CHECK_EQ((item.fmt & HDF_SORTDOWN) != 0, true);
+    }
+    DestroyWindow(created.window);
+}
+
+void TestConnectionCsvCellsMatchAllTwelveVisibleValues() {
+    ConnectionDisplayRow row{};
+    row.connection.key = MakeConnectionKey({42, 100}, TransportProtocol::Tcp,
+        ApplicationProtocol::HttpsTls, 50000, 443);
+    row.connection.sent_bytes = 1024;
+    row.connection.sent_bytes_per_second = 2048;
+    row.connection.received_bytes = 4096;
+    row.connection.received_bytes_per_second = 512;
+    row.status = ConnectionActivityStatus::Active;
+    row.direction = ConnectionDirection::Bidirectional;
+    const auto cells = ConnectionCsvCells(row);
+    const std::vector<std::wstring> expected{
+        L"活跃", L"双向", L"TCP", L"HTTPS/TLS（端口推断）", L"10.0.0.1",
+        L"50000", L"8.8.8.8", L"443", L"1 KB", L"2 KB/s", L"4 KB", L"512 B/s"};
+    CHECK_EQ(cells.size(), expected.size());
+    for (std::size_t index = 0; index < std::min(cells.size(), expected.size()); ++index) {
+        CHECK_EQ(cells[index], expected[index]);
+    }
+}
+
+void TestConnectionWindowSortClickReturnsScrolledListToTop() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    const ProcessInstanceId process{42, 100};
+    const auto now = std::chrono::steady_clock::now();
+    for (std::uint16_t port = 50000; port < 50040; ++port) {
+        connections.Add({MakeConnectionKey(process, TransportProtocol::Tcp,
+            ApplicationProtocol::HttpsTls, port, 443), L"test.exe",
+            TrafficDirection::Send, port, now});
+    }
+    const auto created = CreateConnectionWindow(GetModuleHandleW(nullptr), nullptr,
+        process, L"test.exe", connections, cache);
+    CHECK_EQ(created.window != nullptr, true);
+    if (created.window == nullptr) { return; }
+    SetWindowPos(created.window, nullptr, 0, 0, 900, 240,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    HWND list = FindWindowExW(created.window, nullptr, WC_LISTVIEWW, nullptr);
+    if (list != nullptr) {
+        SendMessageW(created.window, kConnectionWindowRefreshMessage, 0, 0);
+        SendMessageW(list, WM_VSCROLL, SB_PAGEDOWN, 0);
+        CHECK_EQ(ListView_GetTopIndex(list) > 0, true);
+        NMLISTVIEW click{};
+        click.hdr.hwndFrom = list;
+        click.hdr.code = LVN_COLUMNCLICK;
+        click.iSubItem = 5;
+        SendMessageW(created.window, WM_NOTIFY, 0, reinterpret_cast<LPARAM>(&click));
+        CHECK_EQ(ListView_GetTopIndex(list), 0);
+        SendMessageW(list, WM_VSCROLL, SB_PAGEDOWN, 0);
+        const int anchored_top = ListView_GetTopIndex(list);
+        CHECK_EQ(anchored_top > 0, true);
+        ListView_SetItemState(list, anchored_top, LVIS_SELECTED, LVIS_SELECTED);
+        wchar_t anchored_port[32]{};
+        ListView_GetItemText(list, anchored_top, 5, anchored_port,
+                             static_cast<int>(std::size(anchored_port)));
+        connections.Add({MakeConnectionKey(process, TransportProtocol::Tcp,
+            ApplicationProtocol::HttpsTls, 49999, 443), L"test.exe",
+            TrafficDirection::Send, 1, now});
+        SendMessageW(created.window, kConnectionWindowRefreshMessage, 0, 0);
+        wchar_t restored_port[32]{};
+        ListView_GetItemText(list, ListView_GetTopIndex(list), 5, restored_port,
+                             static_cast<int>(std::size(restored_port)));
+        CHECK_EQ(std::wstring_view(restored_port), std::wstring_view(anchored_port));
+        CHECK_EQ((ListView_GetItemState(list, anchored_top + 1, LVIS_SELECTED) &
+                  LVIS_SELECTED) != 0, true);
+        SendMessageW(list, WM_VSCROLL, SB_TOP, 0);
+        connections.Add({MakeConnectionKey(process, TransportProtocol::Tcp,
+            ApplicationProtocol::HttpsTls, 49998, 443), L"test.exe",
+            TrafficDirection::Send, 1, now});
+        SendMessageW(created.window, kConnectionWindowRefreshMessage, 0, 0);
+        CHECK_EQ(ListView_GetTopIndex(list), 0);
+        connections.Clear();
+        SendMessageW(created.window, kConnectionWindowRefreshMessage, 0, 0);
+        CHECK_EQ(ListView_GetItemCount(list), 0);
+    }
+    DestroyWindow(created.window);
+}
+
 void TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop() {
     for (int iteration = 0; iteration < 100; ++iteration) {
         TrafficAggregator aggregator;
@@ -3233,6 +3459,11 @@ int main(int argc, char** argv) {
     TestEtwMonitorBadLengthStopReleasesOwnershipButRetainsValidCounters();
     TestMainWindowRetriesFailedStopInsteadOfStartingAnotherSession();
     TestConnectionCreationPreservesErrorAcrossDestruction();
+    TestConnectionWindowCreatesFilterAndExportToolbar();
+    TestConnectionWindowFiltersBothEndpointsAndPreservesValidPort();
+    TestConnectionWindowColumnClickMarksHeaderAndResetsTop();
+    TestConnectionCsvCellsMatchAllTwelveVisibleValues();
+    TestConnectionWindowSortClickReturnsScrolledListToTop();
     TestEtwMonitorQueriesOwnedLossCountersBeforeConcurrentStop();
     TestEtwMonitorSerializesLossCountersWithConsumerCleanup();
     TestEtwMonitorExposesRealTimeBufferLossSeparately();

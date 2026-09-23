@@ -1,5 +1,8 @@
 #include "connection_view.h"
 
+#include "formatting.h"
+#include "protocol_classifier.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -170,6 +173,24 @@ std::wstring_view ConnectionDirectionName(ConnectionDirection direction) {
         return L"双向";
     }
     return L"双向";
+}
+
+std::vector<std::wstring> ConnectionCsvCells(const ConnectionDisplayRow& row) {
+    const ConnectionSnapshot& connection = row.connection;
+    return {
+        std::wstring(ConnectionActivityStatusText(row.status)),
+        std::wstring(ConnectionDirectionName(row.direction)),
+        std::wstring(TransportProtocolName(connection.key.transport)),
+        std::wstring(ApplicationProtocolName(connection.key.application_protocol)),
+        FormatIpAddress(connection.key.local.address),
+        std::to_wstring(connection.key.local.port),
+        FormatIpAddress(connection.key.remote.address),
+        std::to_wstring(connection.key.remote.port),
+        FormatBytes(connection.sent_bytes),
+        FormatRate(connection.sent_bytes_per_second),
+        FormatBytes(connection.received_bytes),
+        FormatRate(connection.received_bytes_per_second),
+    };
 }
 
 std::vector<ConnectionDisplayRow> BuildConnectionRows(

@@ -68,3 +68,4 @@ std::vector<ConnectionDisplayRow> BuildConnectionRows(
     bool ascending = false);
 void SortConnectionRows(std::vector<ConnectionDisplayRow>& rows,
                         ConnectionSortColumn column, bool ascending);
+std::vector<std::wstring> ConnectionCsvCells(const ConnectionDisplayRow& row);

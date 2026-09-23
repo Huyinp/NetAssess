@@ -2,9 +2,9 @@
 
 #include "connection_aggregator.h"
 #include "connection_view.h"
-#include "formatting.h"
+#include "csv_export.h"
+#include "list_view_state.h"
 #include "process_info.h"
-#include "protocol_classifier.h"
 #include "win32_dpi.h"
 
 #include <algorithm>
@@ -21,6 +21,20 @@
 namespace {
 
 constexpr wchar_t kWindowClassName[] = L"NetAssessConnectionWindow";
+constexpr int kPortFilterId = 101;
+constexpr int kIpFilterId = 102;
+constexpr int kExportId = 103;
+constexpr std::array<std::wstring_view, 12> kColumnNames{
+    L"状态", L"方向", L"传输层协议", L"推断应用协议",
+    L"本地地址", L"本地端口", L"远端地址", L"远端端口",
+    L"上行累计", L"上行速度", L"下行累计", L"下行速度",
+};
+
+void DefaultErrorPresenter(HWND owner, std::wstring_view operation, DWORD error) {
+    const std::wstring message = std::wstring(operation) + L"（错误代码 " +
+                                 std::to_wstring(error) + L"）";
+    MessageBoxW(owner, message.c_str(), L"连接明细", MB_OK | MB_ICONERROR);
+}
 
 DWORD CreationError() {
     const DWORD error = GetLastError();
@@ -51,11 +65,13 @@ class ConnectionWindow {
 public:
     ConnectionWindow(HWND owner, ProcessInstanceId process,
                      ConnectionAggregator& aggregator,
-                     ProcessInfoCache& process_cache)
+                     ProcessInfoCache& process_cache,
+                     ConnectionErrorPresenter error_presenter)
         : owner_(owner),
           process_(process),
           aggregator_(aggregator),
-          process_cache_(process_cache) {}
+          process_cache_(process_cache),
+          error_presenter_(error_presenter != nullptr ? error_presenter : DefaultErrorPresenter) {}
 
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wparam,
                                             LPARAM lparam) {
@@ -112,6 +128,17 @@ private:
         case WM_NOTIFY:
             HandleNotify(reinterpret_cast<NMHDR*>(lparam));
             return 0;
+        case WM_COMMAND:
+            if (reinterpret_cast<HWND>(lparam) == ip_edit_ && HIWORD(wparam) == EN_CHANGE) {
+                ApplyFilterChange(false);
+            } else if (reinterpret_cast<HWND>(lparam) == port_edit_ &&
+                       HIWORD(wparam) == EN_CHANGE) {
+                ApplyFilterChange(true);
+            } else if (reinterpret_cast<HWND>(lparam) == export_button_ &&
+                       HIWORD(wparam) == BN_CLICKED) {
+                ExportRows();
+            }
+            return 0;
         case WM_SIZE:
             LayoutControls();
             return 0;
@@ -156,21 +183,45 @@ private:
             list_view_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER,
             LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
 
-        constexpr std::array<std::wstring_view, 12> column_names{
-            L"状态",       L"方向",       L"传输层协议", L"推断应用协议",
-            L"本地地址",   L"本地端口",   L"远端地址",   L"远端端口",
-            L"上行累计",   L"上行速度",   L"下行累计",   L"下行速度",
-        };
-        for (int index = 0; index < static_cast<int>(column_names.size()); ++index) {
+        for (int index = 0; index < static_cast<int>(kColumnNames.size()); ++index) {
             LVCOLUMNW column{};
             column.mask = LVCF_TEXT | LVCF_SUBITEM;
             column.pszText = const_cast<wchar_t*>(
-                column_names[static_cast<std::size_t>(index)].data());
+                kColumnNames[static_cast<std::size_t>(index)].data());
             column.iSubItem = index;
             SetLastError(ERROR_SUCCESS);
             if (ListView_InsertColumn(list_view_, index, &column) == -1) {
                 return false;
             }
+        }
+        const HINSTANCE instance = reinterpret_cast<HINSTANCE>(
+            GetWindowLongPtrW(window_, GWLP_HINSTANCE));
+        auto create_control = [&](const wchar_t* class_name, const wchar_t* text,
+                                  DWORD style, int id) {
+            return CreateWindowExW(0, class_name, text, WS_CHILD | WS_VISIBLE | style,
+                                   0, 0, 0, 0, window_, reinterpret_cast<HMENU>(
+                                       static_cast<INT_PTR>(id)), instance, nullptr);
+        };
+        ip_label_ = create_control(L"STATIC", L"IP", SS_LEFT, 0);
+        if (ip_label_ == nullptr) { return false; }
+        port_label_ = create_control(L"STATIC", L"端口", SS_LEFT, 0);
+        if (port_label_ == nullptr) { return false; }
+        port_edit_ = create_control(L"EDIT", L"", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+                                    kPortFilterId);
+        if (port_edit_ == nullptr) { return false; }
+        ip_edit_ = create_control(L"EDIT", L"", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+                                  kIpFilterId);
+        if (ip_edit_ == nullptr) { return false; }
+        export_button_ = create_control(L"BUTTON", L"导出 CSV", WS_TABSTOP | BS_PUSHBUTTON,
+                                        kExportId);
+        if (export_button_ == nullptr) { return false; }
+        for (HWND control : {ip_label_, port_label_, port_edit_, ip_edit_, export_button_}) {
+            SendMessageW(control, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+        }
+        if (!SetWindowSubclass(list_view_, ListProcedure, 1,
+                               reinterpret_cast<DWORD_PTR>(this))) {
+            return false;
         }
         UpdateColumnWidths();
         LayoutControls();
@@ -189,15 +240,97 @@ private:
     }
 
     void LayoutControls() const {
-        if (list_view_ == nullptr) {
+        if (list_view_ == nullptr || export_button_ == nullptr) {
             return;
         }
         RECT client{};
         GetClientRect(window_, &client);
         const int margin = win32_dpi::Scale(8, dpi_);
-        MoveWindow(list_view_, margin, margin,
+        const int control_height = win32_dpi::Scale(25, dpi_);
+        const int gap = win32_dpi::Scale(7, dpi_);
+        int x = margin;
+        const auto place = [&](HWND control, int width) {
+            const int scaled_width = win32_dpi::Scale(width, dpi_);
+            MoveWindow(control, x, margin, scaled_width, control_height, TRUE);
+            x += scaled_width + gap;
+        };
+        place(ip_label_, 20);
+        place(ip_edit_, 200);
+        place(port_label_, 36);
+        place(port_edit_, 90);
+        place(export_button_, 100);
+        const int list_top = margin + control_height + margin;
+        MoveWindow(list_view_, margin, list_top,
                    std::max(0, static_cast<int>(client.right) - margin * 2),
-                   std::max(0, static_cast<int>(client.bottom) - margin * 2), TRUE);
+                   std::max(0, static_cast<int>(client.bottom) - list_top - margin), TRUE);
+    }
+
+    static LRESULT CALLBACK ListProcedure(HWND list, UINT message, WPARAM wparam,
+                                          LPARAM lparam, UINT_PTR subclass_id,
+                                          DWORD_PTR context) {
+        auto* self = reinterpret_cast<ConnectionWindow*>(context);
+        if (message == WM_NCDESTROY) {
+            RemoveWindowSubclass(list, ListProcedure, subclass_id);
+            return DefSubclassProc(list, message, wparam, lparam);
+        }
+        const bool user_scroll = message == WM_VSCROLL || message == WM_MOUSEWHEEL ||
+            (message == WM_KEYDOWN &&
+             (wparam == VK_UP || wparam == VK_DOWN || wparam == VK_PRIOR ||
+              wparam == VK_NEXT || wparam == VK_HOME || wparam == VK_END));
+        const LRESULT result = DefSubclassProc(list, message, wparam, lparam);
+        if (user_scroll) {
+            self->scroll_state_.ObserveUserScroll(ListView_GetTopIndex(list) == 0);
+        }
+        return result;
+    }
+
+    static std::wstring EditText(HWND edit) {
+        std::wstring text(static_cast<std::size_t>(GetWindowTextLengthW(edit)) + 1, L'\0');
+        text.resize(static_cast<std::size_t>(GetWindowTextW(
+            edit, text.data(), static_cast<int>(text.size()))));
+        return text;
+    }
+
+    void ApplyFilterChange(bool port_changed) {
+        if (port_changed) {
+            const PortFilterParseResult parsed = ParsePortFilter(EditText(port_edit_));
+            if (!parsed.valid) {
+                if (!invalid_port_reported_) {
+                    invalid_port_reported_ = true;
+                    error_presenter_(window_, L"端口筛选无效，请输入 0–65535 的十进制端口",
+                                     ERROR_INVALID_DATA);
+                }
+                return;
+            }
+            invalid_port_reported_ = false;
+            filter_.port = parsed.port;
+        } else {
+            filter_.ip = EditText(ip_edit_);
+        }
+        scroll_state_.ResetToAutoTop();
+        RebuildFilteredRows();
+    }
+
+    void RebuildFilteredRows() {
+        rows_ = FilterConnectionRows(raw_rows_, filter_);
+        SortConnectionRows(rows_, sort_column_, ascending_);
+        ReconcileRows();
+    }
+
+    void ExportRows() {
+        std::array<std::wstring, 12> headers{};
+        for (std::size_t index = 0; index < headers.size(); ++index) {
+            headers[index] = kColumnNames[index];
+        }
+        std::vector<std::vector<std::wstring>> data;
+        data.reserve(rows_.size());
+        for (const ConnectionDisplayRow& row : rows_) {
+            data.push_back(ConnectionCsvCells(row));
+        }
+        const CsvSaveResult result = SaveCsvWithDialog(window_, L"连接明细.csv", headers, data);
+        if (result.error != ERROR_SUCCESS) {
+            error_presenter_(window_, L"导出 CSV 失败", result.error);
+        }
     }
 
     void HandleNotify(const NMHDR* notification) {
@@ -214,6 +347,8 @@ private:
             sort_column_ = clicked_column;
             ascending_ = true;
         }
+        scroll_state_.ResetToAutoTop();
+        UpdateListViewSortIndicator(list_view_, column_click->iSubItem, ascending_);
         SortConnectionRows(rows_, sort_column_, ascending_);
         ReconcileRows();
     }
@@ -221,12 +356,12 @@ private:
     void RefreshSnapshot() {
         const auto now = std::chrono::steady_clock::now();
         const auto snapshots = aggregator_.Snapshot(process_, now);
-        rows_ = BuildConnectionRows(snapshots, process_cache_.RefreshAlive(process_),
-                                    now, sort_column_, ascending_);
-        ReconcileRows();
+        raw_rows_ = BuildConnectionRows(snapshots, process_cache_.RefreshAlive(process_), now);
+        RebuildFilteredRows();
     }
 
     void ReconcileRows() {
+        auto guard = scroll_state_.GuardProgrammaticScroll();
         const std::set<ConnectionKey> selected_keys = SelectedKeys();
         const ScrollAnchor scroll_anchor = CaptureScrollAnchor();
         ReconcileRowStructure();
@@ -313,19 +448,10 @@ private:
     }
 
     void UpdateRow(int index, const ConnectionDisplayRow& row) const {
-        const ConnectionSnapshot& connection = row.connection;
-        SetItemText(index, 0, ConnectionActivityStatusText(row.status));
-        SetItemText(index, 1, ConnectionDirectionName(row.direction));
-        SetItemText(index, 2, TransportProtocolName(connection.key.transport));
-        SetItemText(index, 3, ApplicationProtocolName(connection.key.application_protocol));
-        SetItemText(index, 4, FormatIpAddress(connection.key.local.address));
-        SetItemText(index, 5, std::to_wstring(connection.key.local.port));
-        SetItemText(index, 6, FormatIpAddress(connection.key.remote.address));
-        SetItemText(index, 7, std::to_wstring(connection.key.remote.port));
-        SetItemText(index, 8, FormatBytes(connection.sent_bytes));
-        SetItemText(index, 9, FormatRate(connection.sent_bytes_per_second));
-        SetItemText(index, 10, FormatBytes(connection.received_bytes));
-        SetItemText(index, 11, FormatRate(connection.received_bytes_per_second));
+        const auto cells = ConnectionCsvCells(row);
+        for (int column = 0; column < static_cast<int>(cells.size()); ++column) {
+            SetItemText(index, column, cells[static_cast<std::size_t>(column)]);
+        }
     }
 
     void SetItemText(int row, int column, std::wstring_view text) const {
@@ -352,8 +478,9 @@ private:
         if (count == 0) {
             return;
         }
-        int target = std::min(anchor.previous_top, count - 1);
-        if (anchor.key) {
+        int target = scroll_state_.auto_top() ? 0 :
+            std::clamp(anchor.previous_top, 0, count - 1);
+        if (!scroll_state_.auto_top() && anchor.key) {
             const auto row = row_map_.find(*anchor.key);
             if (row != row_map_.end()) {
                 target = row->second;
@@ -375,10 +502,20 @@ private:
     ProcessInfoCache& process_cache_;
     HWND window_{};
     HWND list_view_{};
+    HWND ip_label_{};
+    HWND ip_edit_{};
+    HWND port_label_{};
+    HWND port_edit_{};
+    HWND export_button_{};
+    ConnectionErrorPresenter error_presenter_{};
+    ConnectionFilter filter_;
+    ListScrollState scroll_state_;
+    bool invalid_port_reported_{};
     UINT dpi_{win32_dpi::kDefaultDpi};
     ConnectionSortColumn sort_column_{ConnectionSortColumn::CombinedSpeed};
     bool ascending_{};
     std::vector<ConnectionDisplayRow> rows_;
+    std::vector<ConnectionDisplayRow> raw_rows_;
     std::vector<ConnectionKey> current_keys_;
     std::map<ConnectionKey, int> row_map_;
 };
@@ -402,7 +539,8 @@ bool RegisterWindowClass(HINSTANCE instance) {
 
 ConnectionWindowCreationResult CreateConnectionWindow(
     HINSTANCE instance, HWND owner, ProcessInstanceId process, std::wstring process_name,
-    ConnectionAggregator& aggregator, ProcessInfoCache& process_cache) {
+    ConnectionAggregator& aggregator, ProcessInfoCache& process_cache,
+    ConnectionErrorPresenter error_presenter) {
     if (!RegisterWindowClass(instance)) {
         return {nullptr, CreationError()};
     }
@@ -415,7 +553,8 @@ ConnectionWindowCreationResult CreateConnectionWindow(
 
     std::wstring title = process_name + L" — PID " + std::to_wstring(process.pid) +
                          L" — 连接明细";
-    auto* state = new ConnectionWindow(owner, process, aggregator, process_cache);
+    auto* state = new ConnectionWindow(owner, process, aggregator, process_cache,
+                                       error_presenter);
     ConnectionWindow::CreationContext context{state};
     SetLastError(ERROR_SUCCESS);
     HWND window = CreateWindowExW(
