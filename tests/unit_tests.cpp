@@ -38,6 +38,8 @@
 #include <tdh.h>
 #include <commctrl.h>
 
+#include "list_view_state.h"
+
 namespace {
 
 int failures = 0;
@@ -3044,6 +3046,107 @@ void TestTerminatePropagatesBoundaryFailures() {
     }
 }
 
+void TestListScrollStateTracksOnlyUserIntent() {
+    ListScrollState state;
+    CHECK_EQ(state.auto_top(), true);
+
+    state.ObserveUserScroll(false);
+    CHECK_EQ(state.auto_top(), false);
+
+    state.ObserveUserScroll(true);
+    CHECK_EQ(state.auto_top(), true);
+
+    state.ObserveUserScroll(false);
+    state.ResetToAutoTop();
+    CHECK_EQ(state.auto_top(), true);
+}
+
+void TestListScrollStateIgnoresNestedProgrammaticRestoration() {
+    ListScrollState state;
+    state.ObserveUserScroll(false);
+
+    {
+        auto outer = state.GuardProgrammaticScroll();
+        state.ObserveUserScroll(true);
+        {
+            auto inner = state.GuardProgrammaticScroll();
+            state.ObserveUserScroll(false);
+        }
+        state.ObserveUserScroll(true);
+    }
+    CHECK_EQ(state.auto_top(), false);
+
+    state.ObserveUserScroll(true);
+    CHECK_EQ(state.auto_top(), true);
+
+    try {
+        auto guard = state.GuardProgrammaticScroll();
+        state.ObserveUserScroll(false);
+        throw std::runtime_error("restore failed");
+    } catch (const std::runtime_error&) {
+    }
+    CHECK_EQ(state.auto_top(), true);
+
+    state.ObserveUserScroll(false);
+    CHECK_EQ(state.auto_top(), false);
+}
+
+void TestListViewSortIndicatorUpdatesOnlySortFlags() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls) != FALSE, true);
+
+    HWND list_view = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_POPUP | LVS_REPORT,
+                                     0, 0, 320, 200, nullptr, nullptr,
+                                     GetModuleHandleW(nullptr), nullptr);
+    CHECK_EQ(list_view != nullptr, true);
+    if (list_view == nullptr) {
+        return;
+    }
+
+    for (int column = 0; column < 3; ++column) {
+        LVCOLUMNW item{};
+        item.mask = LVCF_TEXT | LVCF_WIDTH;
+        item.pszText = const_cast<wchar_t*>(L"Column");
+        item.cx = 80;
+        CHECK_EQ(ListView_InsertColumn(list_view, column, &item), column);
+    }
+
+    HWND header = ListView_GetHeader(list_view);
+    HDITEMW item{};
+    item.mask = HDI_FORMAT;
+    CHECK_EQ(Header_GetItem(header, 1, &item) != FALSE, true);
+    item.fmt |= HDF_BITMAP_ON_RIGHT;
+    CHECK_EQ(Header_SetItem(header, 1, &item) != FALSE, true);
+
+    UpdateListViewSortIndicator(list_view, 1, true);
+    CHECK_EQ(Header_GetItem(header, 1, &item) != FALSE, true);
+    CHECK_EQ((item.fmt & HDF_SORTUP) != 0, true);
+    CHECK_EQ((item.fmt & HDF_SORTDOWN) == 0, true);
+    CHECK_EQ((item.fmt & HDF_BITMAP_ON_RIGHT) != 0, true);
+
+    UpdateListViewSortIndicator(list_view, 1, false);
+    CHECK_EQ(Header_GetItem(header, 1, &item) != FALSE, true);
+    CHECK_EQ((item.fmt & HDF_SORTUP) == 0, true);
+    CHECK_EQ((item.fmt & HDF_SORTDOWN) != 0, true);
+
+    UpdateListViewSortIndicator(list_view, 2, true);
+    CHECK_EQ(Header_GetItem(header, 1, &item) != FALSE, true);
+    CHECK_EQ((item.fmt & (HDF_SORTUP | HDF_SORTDOWN)) == 0, true);
+    CHECK_EQ((item.fmt & HDF_BITMAP_ON_RIGHT) != 0, true);
+    CHECK_EQ(Header_GetItem(header, 2, &item) != FALSE, true);
+    CHECK_EQ((item.fmt & HDF_SORTUP) != 0, true);
+    CHECK_EQ((item.fmt & HDF_SORTDOWN) == 0, true);
+
+    UpdateListViewSortIndicator(nullptr, 0, false);
+    UpdateListViewSortIndicator(list_view, -1, false);
+    UpdateListViewSortIndicator(list_view, 3, false);
+    CHECK_EQ(Header_GetItem(header, 2, &item) != FALSE, true);
+    CHECK_EQ((item.fmt & HDF_SORTUP) != 0, true);
+    CHECK_EQ((item.fmt & HDF_SORTDOWN) == 0, true);
+
+    CHECK_EQ(DestroyWindow(list_view) != FALSE, true);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3157,6 +3260,9 @@ int main(int argc, char** argv) {
     TestTerminateValidatesInstanceWithOnlyRequiredRights();
     TestTerminateRejectsReusedPidWithoutTerminating();
     TestTerminatePropagatesBoundaryFailures();
+    TestListScrollStateTracksOnlyUserIntent();
+    TestListScrollStateIgnoresNestedProgrammaticRestoration();
+    TestListViewSortIndicatorUpdatesOnlySortFlags();
 
     return failures == 0 ? 0 : 1;
 }

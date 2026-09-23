@@ -28,6 +28,7 @@ endif()
 add_library(NetAssessCore STATIC src/protocol_classifier.cpp src/traffic_aggregator.cpp
                                   src/connection_aggregator.cpp src/formatting.cpp
                                   src/connection_view.cpp
+                                  src/list_view_state.cpp
                                   src/csv_export.cpp
                                   src/process_info.cpp src/etw_decoder.cpp src/etw_monitor.cpp
                                   src/process_actions.cpp
