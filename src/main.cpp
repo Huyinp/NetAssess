@@ -3,6 +3,7 @@
 #include "connection_aggregator.h"
 #include "etw_monitor.h"
 #include "process_info.h"
+#include "single_instance.h"
 #include "traffic_aggregator.h"
 
 #include <commctrl.h>
@@ -46,6 +47,15 @@ void EnableBestDpiAwareness() {
 }  // namespace
 
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
+    SingleInstanceGuard single_instance;
+    if (!single_instance.acquired()) {
+        const wchar_t* message = single_instance.error() == ERROR_ALREADY_EXISTS
+                                     ? L"NetAssess 已经在运行。"
+                                     : L"无法创建 NetAssess 单实例锁。";
+        MessageBoxW(nullptr, message, L"NetAssess", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
     EnableBestDpiAwareness();
 
     INITCOMMONCONTROLSEX controls{};

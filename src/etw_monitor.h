@@ -33,6 +33,8 @@ public:
     virtual ULONG CloseTrace(TRACEHANDLE trace_handle) = 0;
     virtual ULONG ControlTraceW(TRACEHANDLE session_handle, LPCWSTR session_name,
                                 EVENT_TRACE_PROPERTIES* properties, ULONG control_code) = 0;
+    virtual ULONG QueryAllTracesW(EVENT_TRACE_PROPERTIES** property_array,
+                                  ULONG property_array_count, PULONG logger_count) = 0;
 };
 
 struct EtwLossCounters {

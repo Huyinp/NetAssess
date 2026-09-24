@@ -5,7 +5,6 @@
 #include "csv_export.h"
 #include "etw_monitor.h"
 #include "list_view_state.h"
-#include "network_rate_monitor.h"
 #include "process_info.h"
 #include "process_actions.h"
 #include "protocol_classifier.h"
@@ -66,6 +65,10 @@ std::wstring SystemErrorText(ULONG error) {
     if (error == ERROR_SUCCESS) {
         return L"无";
     }
+    if (error == ERROR_NO_SYSTEM_RESOURCES) {
+        return L"错误 1450（ETW 系统记录器名额已满；已尝试清理 NetAssess 遗留会话，"
+               L"请停止不需要的其他跟踪会话后重试）";
+    }
 
     wchar_t buffer[512]{};
     const DWORD length = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM |
@@ -110,9 +113,6 @@ public:
         if (dependencies_.process_actions == nullptr) {
             dependencies_.process_actions = &owned_process_actions_;
         }
-        if (dependencies_.network_rate_monitor == nullptr) {
-            dependencies_.network_rate_monitor = &owned_network_rate_monitor_;
-        }
         if (dependencies_.choose_menu_command == nullptr) {
             dependencies_.choose_menu_command = ChooseMenuCommand;
         }
@@ -124,9 +124,6 @@ public:
         }
         if (dependencies_.save_csv == nullptr) {
             dependencies_.save_csv = SaveCsvWithDialog;
-        }
-        if (dependencies_.sample_time == nullptr) {
-            dependencies_.sample_time = std::chrono::steady_clock::now;
         }
     }
 
@@ -206,8 +203,6 @@ private:
             return DefWindowProcW(window_, message, wparam, lparam);
         case WM_TIMER:
             if (wparam == kRefreshTimerId) {
-                network_rate_snapshot_ = dependencies_.network_rate_monitor->Snapshot(
-                    dependencies_.sample_time());
                 RefreshSnapshot();
             }
             return 0;
@@ -759,18 +754,11 @@ private:
             L"  |  明细丢弃：" +
                 std::to_wstring(connection_aggregator_.dropped_detail_events()) +
             L"  |  最近错误：" + SystemErrorText(monitor_.last_error());
-        if (network_rate_snapshot_) {
-            const auto& rate = *network_rate_snapshot_;
-            if (rate.error == ERROR_SUCCESS) {
-                status += L"  |  总网速：↑ " + FormatRate(rate.sent_bytes_per_second) +
-                          L" ↓ " + FormatRate(rate.received_bytes_per_second) +
-                          L" 合计 " + FormatRate(rate.sent_bytes_per_second +
-                                                rate.received_bytes_per_second);
-            } else {
-                status += L"  |  总网速：不可用（错误 " +
-                          std::to_wstring(rate.error) + L"）";
-            }
-        }
+        const TrafficRateTotals rate = SumTrafficRates(last_snapshot_);
+        status += L"  |  进程总网速：↑ " + FormatRate(rate.sent_bytes_per_second) +
+                  L" ↓ " + FormatRate(rate.received_bytes_per_second) +
+                  L" 合计 " + FormatRate(rate.sent_bytes_per_second +
+                                        rate.received_bytes_per_second);
         SendMessageW(status_bar_, SB_SETTEXTW, 0,
                      reinterpret_cast<LPARAM>(status.c_str()));
     }
@@ -780,7 +768,6 @@ private:
     ProcessInfoCache& process_cache_;
     EtwMonitor& monitor_;
     ProcessActions owned_process_actions_;
-    NetworkRateMonitor owned_network_rate_monitor_;
     MainWindowDependencies dependencies_;
     HWND window_{};
     HWND start_stop_button_{};
@@ -795,7 +782,6 @@ private:
     SortColumn sort_column_{SortColumn::CombinedSpeed};
     bool ascending_{};
     ListScrollState scroll_state_;
-    std::optional<NetworkRateSnapshot> network_rate_snapshot_;
     std::vector<TrafficSnapshot> last_snapshot_;
     std::vector<TrafficKey> current_keys_;
     std::map<TrafficKey, int> row_map_;
@@ -818,6 +804,15 @@ bool RegisterWindowClass(HINSTANCE instance) {
 }
 
 }  // namespace
+
+TrafficRateTotals SumTrafficRates(std::span<const TrafficSnapshot> snapshots) {
+    TrafficRateTotals totals{};
+    for (const TrafficSnapshot& snapshot : snapshots) {
+        totals.sent_bytes_per_second += snapshot.sent_bytes_per_second;
+        totals.received_bytes_per_second += snapshot.received_bytes_per_second;
+    }
+    return totals;
+}
 
 std::vector<TrafficDisplayRow> BuildVisibleRows(
     const std::vector<TrafficSnapshot>& snapshots, std::wstring_view filter,

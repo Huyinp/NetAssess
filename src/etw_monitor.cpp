@@ -3,13 +3,17 @@
 #include "protocol_classifier.h"
 
 #include <cstring>
+#include <cwctype>
 #include <iterator>
+#include <memory>
 #include <system_error>
 #include <utility>
 
-#include <objbase.h>
-
 namespace {
+
+constexpr wchar_t kSessionName[] = L"NetAssess-Kernel-Network";
+constexpr GUID kSessionGuid{0x8f0f9e61, 0x6f72, 0x4d5c,
+                            {0x89, 0x9f, 0x36, 0x65, 0x35, 0x39, 0x58, 0x1d}};
 
 class WindowsEtwSessionApi final : public IEtwSessionApi {
 public:
@@ -35,16 +39,16 @@ public:
                         EVENT_TRACE_PROPERTIES* properties, ULONG control_code) override {
         return ::ControlTraceW(session_handle, session_name, properties, control_code);
     }
+
+    ULONG QueryAllTracesW(EVENT_TRACE_PROPERTIES** property_array,
+                          ULONG property_array_count, PULONG logger_count) override {
+        return ::QueryAllTracesW(property_array, property_array_count, logger_count);
+    }
 };
 
 IEtwSessionApi& DefaultSessionApi() {
     static WindowsEtwSessionApi api;
     return api;
-}
-
-ULONG HResultToWin32(HRESULT result) {
-    return HRESULT_FACILITY(result) == FACILITY_WIN32 ? HRESULT_CODE(result)
-                                                       : ERROR_GEN_FAILURE;
 }
 
 bool IsIgnorableCloseResult(ULONG result) {
@@ -54,6 +58,91 @@ bool IsIgnorableCloseResult(ULONG result) {
 bool IsCompletedStopResult(ULONG result) {
     return result == ERROR_SUCCESS || result == ERROR_BAD_LENGTH || result == ERROR_MORE_DATA ||
            result == ERROR_WMI_INSTANCE_NOT_FOUND || result == ERROR_ACTIVE_CONNECTIONS;
+}
+
+bool IsHexDigit(wchar_t value) {
+    return std::iswxdigit(value) != 0;
+}
+
+bool IsLegacySessionName(std::wstring_view name) {
+    constexpr std::wstring_view prefix = L"NetAssess-";
+    if (!name.starts_with(prefix)) {
+        return false;
+    }
+    const std::size_t pid_end = name.find(L'-', prefix.size());
+    if (pid_end == std::wstring_view::npos || pid_end == prefix.size()) {
+        return false;
+    }
+    for (std::size_t index = prefix.size(); index < pid_end; ++index) {
+        if (!std::iswdigit(name[index])) {
+            return false;
+        }
+    }
+
+    const std::wstring_view guid = name.substr(pid_end + 1);
+    if (guid.size() != 38 || guid.front() != L'{' || guid.back() != L'}') {
+        return false;
+    }
+    for (std::size_t index = 1; index + 1 < guid.size(); ++index) {
+        const bool separator = index == 9 || index == 14 || index == 19 || index == 24;
+        if ((separator && guid[index] != L'-') || (!separator && !IsHexDigit(guid[index]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+ULONG CleanupOwnedSessions(IEtwSessionApi& api, std::size_t& stopped_count) {
+    constexpr ULONG initial_loggers = 64;
+    constexpr ULONG max_loggers = 256;
+    constexpr std::size_t name_capacity = 1024;
+    constexpr std::size_t buffer_size =
+        sizeof(EVENT_TRACE_PROPERTIES) + 2 * name_capacity * sizeof(wchar_t);
+    try {
+        ULONG capacity = initial_loggers;
+        for (;;) {
+            std::vector<std::vector<std::byte>> buffers(
+                capacity, std::vector<std::byte>(buffer_size));
+            std::vector<EVENT_TRACE_PROPERTIES*> properties(capacity);
+            for (ULONG index = 0; index < capacity; ++index) {
+                properties[index] =
+                    reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buffers[index].data());
+                properties[index]->Wnode.BufferSize = static_cast<ULONG>(buffer_size);
+                properties[index]->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+                properties[index]->LogFileNameOffset =
+                    sizeof(EVENT_TRACE_PROPERTIES) + name_capacity * sizeof(wchar_t);
+            }
+
+            ULONG logger_count{};
+            const ULONG query_result =
+                api.QueryAllTracesW(properties.data(), capacity, &logger_count);
+            if (query_result == ERROR_MORE_DATA && logger_count > capacity &&
+                logger_count <= max_loggers) {
+                capacity = logger_count;
+                continue;
+            }
+            if (query_result != ERROR_SUCCESS) {
+                return query_result;
+            }
+            for (ULONG index = 0; index < logger_count; ++index) {
+                const auto* name = reinterpret_cast<const wchar_t*>(
+                    buffers[index].data() + properties[index]->LoggerNameOffset);
+                const std::wstring_view session_name(name);
+                if (session_name != kSessionName && !IsLegacySessionName(session_name)) {
+                    continue;
+                }
+                const ULONG stop_result = api.ControlTraceW(
+                    0, name, properties[index], EVENT_TRACE_CONTROL_STOP);
+                if (!IsCompletedStopResult(stop_result)) {
+                    return stop_result;
+                }
+                ++stopped_count;
+            }
+            return ERROR_SUCCESS;
+        }
+    } catch (const std::bad_alloc&) {
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
 }
 
 void SubmitEvents(TrafficAggregator& aggregator, ConnectionAggregator& connection_aggregator,
@@ -122,26 +211,14 @@ bool EtwMonitor::Start() {
     events_lost_.store(0, std::memory_order_relaxed);
     real_time_buffers_lost_.store(0, std::memory_order_relaxed);
 
-    GUID session_guid{};
-    const HRESULT guid_result = CoCreateGuid(&session_guid);
-    if (FAILED(guid_result)) {
-        last_error_.store(HResultToWin32(guid_result), std::memory_order_relaxed);
-        return false;
-    }
-
-    wchar_t guid_text[39]{};
-    if (StringFromGUID2(session_guid, guid_text, static_cast<int>(std::size(guid_text))) == 0) {
-        last_error_.store(ERROR_INSUFFICIENT_BUFFER, std::memory_order_relaxed);
-        return false;
-    }
-    session_name_ = L"NetAssess-" + std::to_wstring(GetCurrentProcessId()) + L"-" + guid_text;
+    session_name_ = kSessionName;
 
     const std::size_t properties_size =
         sizeof(EVENT_TRACE_PROPERTIES) + (session_name_.size() + 1) * sizeof(wchar_t);
     properties_buffer_.assign(properties_size, std::byte{});
     auto* trace_properties = properties();
     trace_properties->Wnode.BufferSize = static_cast<ULONG>(properties_size);
-    trace_properties->Wnode.Guid = session_guid;
+    trace_properties->Wnode.Guid = kSessionGuid;
     trace_properties->Wnode.ClientContext = 1;
     trace_properties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
     trace_properties->LogFileMode =
@@ -151,8 +228,19 @@ bool EtwMonitor::Start() {
     std::memcpy(properties_buffer_.data() + trace_properties->LoggerNameOffset,
                 session_name_.c_str(), (session_name_.size() + 1) * sizeof(wchar_t));
 
-    const ULONG start_result =
+    ULONG start_result =
         session_api_.StartTraceW(&session_handle_, session_name_.c_str(), trace_properties);
+    if (start_result == ERROR_NO_SYSTEM_RESOURCES || start_result == ERROR_ALREADY_EXISTS) {
+        std::size_t stopped_count{};
+        const ULONG cleanup_result = CleanupOwnedSessions(session_api_, stopped_count);
+        if (cleanup_result != ERROR_SUCCESS) {
+            start_result = cleanup_result;
+        } else if (stopped_count != 0) {
+            session_handle_ = 0;
+            start_result = session_api_.StartTraceW(
+                &session_handle_, session_name_.c_str(), trace_properties);
+        }
+    }
     if (start_result != ERROR_SUCCESS) {
         last_error_.store(start_result, std::memory_order_relaxed);
         session_handle_ = 0;

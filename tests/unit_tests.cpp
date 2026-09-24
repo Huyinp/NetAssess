@@ -1,5 +1,3 @@
-#include "network_rate_monitor.h"
-
 #include "etw_decoder.h"
 #include "etw_monitor.h"
 #include "connection_aggregator.h"
@@ -11,6 +9,7 @@
 #include "process_info.h"
 #include "process_actions.h"
 #include "protocol_classifier.h"
+#include "single_instance.h"
 #include "traffic_aggregator.h"
 #include "win32_dpi.h"
 
@@ -158,10 +157,12 @@ public:
         allow_worker_action = false;
         worker_action_finished = false;
         worker_action_threw = false;
-        if (start_status == ERROR_SUCCESS) {
+        const ULONG result = start_status_index < start_statuses.size()
+                                 ? start_statuses[start_status_index++] : start_status;
+        if (result == ERROR_SUCCESS) {
             *session_handle = session_handle_to_return;
         }
-        return start_status;
+        return result;
     }
 
     TRACEHANDLE OpenTraceW(EVENT_TRACE_LOGFILEW* log_file) override {
@@ -249,6 +250,7 @@ public:
         ++control_stop_calls;
         controlled_session_handle = session_handle;
         controlled_name = session_name;
+        stopped_names.emplace_back(session_name == nullptr ? L"" : session_name);
         controlled_code = control_code;
         calls.emplace_back("control-stop");
         properties->EventsLost = stop_events_lost;
@@ -262,6 +264,24 @@ public:
             return control_stop_statuses[control_stop_index++];
         }
         return control_status;
+    }
+
+    ULONG QueryAllTracesW(EVENT_TRACE_PROPERTIES** property_array,
+                          ULONG property_array_count, PULONG logger_count) override {
+        ++query_all_calls;
+        *logger_count = static_cast<ULONG>(active_session_names.size());
+        if (property_array_count < active_session_names.size()) {
+            return ERROR_MORE_DATA;
+        }
+        for (std::size_t index = 0; index < active_session_names.size(); ++index) {
+            auto* properties = property_array[index];
+            auto* name = reinterpret_cast<wchar_t*>(
+                reinterpret_cast<std::byte*>(properties) + properties->LoggerNameOffset);
+            const std::size_t capacity =
+                (properties->Wnode.BufferSize - properties->LoggerNameOffset) / sizeof(wchar_t);
+            wcsncpy_s(name, capacity, active_session_names[index].c_str(), _TRUNCATE);
+        }
+        return query_all_status;
     }
 
     bool WaitForConsumers(int expected = 1) {
@@ -348,6 +368,9 @@ public:
     }
 
     ULONG start_status{ERROR_SUCCESS};
+    std::vector<ULONG> start_statuses;
+    std::size_t start_status_index{};
+    ULONG query_all_status{ERROR_SUCCESS};
     ULONG query_status{ERROR_SUCCESS};
     ULONG open_error{ERROR_INVALID_HANDLE};
     ULONG process_status{ERROR_CANCELLED};
@@ -371,6 +394,7 @@ public:
     int close_trace_calls{};
     int control_query_calls{};
     int control_stop_calls{};
+    int query_all_calls{};
     std::wstring started_name;
     std::wstring opened_name;
     std::wstring controlled_name;
@@ -389,6 +413,8 @@ public:
     TRACEHANDLE queried_session_handle{};
     ULONG controlled_code{};
     std::vector<std::string> calls;
+    std::vector<std::wstring> active_session_names;
+    std::vector<std::wstring> stopped_names;
 
 private:
     std::mutex mutex;
@@ -534,33 +560,6 @@ public:
     int shell_show{};
     std::vector<std::wstring> calls;
 };
-
-class FakeNetworkInterfaceApi final : public INetworkInterfaceApi {
-public:
-    DWORD Query(std::vector<NetworkInterfaceCounters>& rows) override {
-        if (query_index < results.size()) {
-            rows = results[query_index].rows;
-            return results[query_index++].error;
-        }
-        rows.clear();
-        return ERROR_SUCCESS;
-    }
-
-    struct Result {
-        DWORD error;
-        std::vector<NetworkInterfaceCounters> rows;
-    };
-
-    std::vector<Result> results;
-    std::size_t query_index{};
-};
-
-NetworkInterfaceCounters MakeNetworkInterface(std::uint64_t luid, std::uint64_t received,
-                                               std::uint64_t sent,
-                                               IF_OPER_STATUS status = IfOperStatusUp,
-                                               NET_IFTYPE type = IF_TYPE_ETHERNET_CSMACD) {
-    return {luid, status, type, received, sent};
-}
 
 int RunEtwMonitorStopInterleavingChild() {
     TrafficAggregator aggregator;
@@ -1774,6 +1773,18 @@ void TestVisibleRowsFilterWithoutMutatingSnapshotAndAttachLiveness() {
     CHECK_EQ(snapshots[1].process_name, L"beta.exe");
 }
 
+void TestProcessRateTotalsSumEveryCapturedProcess() {
+    const std::array snapshots{
+        MakeSnapshot({{1, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http},
+                     L"first.exe", 100.0, 25.0),
+        MakeSnapshot({{2, 2}, TransportProtocol::Udp, ApplicationProtocol::Dns},
+                     L"second.exe", 50.0, 75.0)};
+
+    const auto totals = SumTrafficRates(snapshots);
+    CHECK_EQ(totals.sent_bytes_per_second, 150.0);
+    CHECK_EQ(totals.received_bytes_per_second, 100.0);
+}
+
 void TestVisibleRowsDefaultOrderUsesCombinedSpeedDescending() {
     const TrafficKey slow{{201, 11}, TransportProtocol::Tcp, ApplicationProtocol::Http};
     const TrafficKey fast{{202, 22}, TransportProtocol::Udp, ApplicationProtocol::Dns};
@@ -1978,6 +1989,23 @@ void TestProcessInfoCreationQueryFailureEventuallyDetectsPidReuse() {
     CHECK_EQ(api.query_creation_time_calls, 8);
 }
 
+void TestSingleInstanceGuardRejectsSecondOwnerAndReleasesName() {
+    const std::wstring name = L"Local\\NetAssessTests-" +
+                              std::to_wstring(GetCurrentProcessId()) + L"-single-instance";
+    {
+        SingleInstanceGuard first(name);
+        CHECK_EQ(first.acquired(), true);
+        CHECK_EQ(first.error(), static_cast<DWORD>(ERROR_SUCCESS));
+
+        SingleInstanceGuard second(name);
+        CHECK_EQ(second.acquired(), false);
+        CHECK_EQ(second.error(), static_cast<DWORD>(ERROR_ALREADY_EXISTS));
+    }
+
+    SingleInstanceGuard after_release(name);
+    CHECK_EQ(after_release.acquired(), true);
+}
+
 void TestEtwMonitorStartsOneConfiguredConsumer() {
     TrafficAggregator aggregator;
     ConnectionAggregator connection_aggregator;
@@ -1991,7 +2019,7 @@ void TestEtwMonitorStartsOneConfiguredConsumer() {
     CHECK_EQ(api.start_trace_calls, 1);
     CHECK_EQ(api.open_trace_calls, 1);
     CHECK_EQ(api.process_trace_calls, 1);
-    CHECK_EQ(api.started_name.starts_with(L"NetAssess-"), true);
+    CHECK_EQ(api.started_name, L"NetAssess-Kernel-Network");
     CHECK_EQ(api.opened_name, api.started_name);
     CHECK_EQ(IsEqualGUID(api.properties_guid, GUID_NULL), FALSE);
     CHECK_EQ(api.properties_flags, static_cast<ULONG>(WNODE_FLAG_TRACED_GUID));
@@ -2055,6 +2083,29 @@ void TestEtwMonitorExposesStartTraceFailureWithoutOpeningConsumer() {
     CHECK_EQ(api.process_trace_calls, 0);
     CHECK_EQ(api.control_stop_calls, 0);
     CHECK_EQ(api.close_trace_calls, 0);
+}
+
+void TestEtwMonitorCleansOnlyLegacyNetAssessSessionsAndRetriesResourceFailure() {
+    TrafficAggregator aggregator;
+    ConnectionAggregator connection_aggregator;
+    ProcessInfoCache process_cache;
+    FakeEtwSessionApi api;
+    api.start_statuses = {ERROR_NO_SYSTEM_RESOURCES, ERROR_SUCCESS};
+    api.active_session_names = {
+        L"NetAssess-1234-{01234567-89AB-CDEF-0123-456789ABCDEF}",
+        L"Other-Monitor",
+        L"NetAssess-not-a-legacy-session"};
+    EtwMonitor monitor(aggregator, connection_aggregator, process_cache, api);
+
+    CHECK_EQ(monitor.Start(), true);
+    CHECK_EQ(api.WaitForConsumers(), true);
+    CHECK_EQ(api.start_trace_calls, 2);
+    CHECK_EQ(api.query_all_calls, 1);
+    CHECK_EQ(api.stopped_names.size(), 1U);
+    if (!api.stopped_names.empty()) {
+        CHECK_EQ(api.stopped_names[0], api.active_session_names[0]);
+    }
+    monitor.Stop();
 }
 
 void TestEtwMonitorCleansOwnedSessionWhenOpenTraceFails() {
@@ -2199,6 +2250,28 @@ void TestMainWindowRetriesFailedStopInsteadOfStartingAnotherSession() {
     while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
 }
 
+void TestMainWindowExplainsEtwLoggerExhaustion() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    TrafficAggregator traffic;
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    FakeEtwSessionApi api;
+    api.start_status = ERROR_NO_SYSTEM_RESOURCES;
+    EtwMonitor monitor(traffic, connections, cache, api);
+    HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections, cache, monitor);
+    CHECK_EQ(window != nullptr, true);
+    if (window == nullptr) { return; }
+
+    CHECK_EQ(StartMainWindowCollection(window), false);
+    HWND status = FindWindowExW(window, nullptr, STATUSCLASSNAMEW, nullptr);
+    std::wstring text(512, L'\0');
+    SendMessageW(status, SB_GETTEXTW, 0, reinterpret_cast<LPARAM>(text.data()));
+    text.resize(std::wcslen(text.c_str()));
+    CHECK_EQ(text.find(L"ETW 系统记录器名额已满") != std::wstring::npos, true);
+    DestroyWindow(window);
+}
+
 int main_list_destroy_notifications = 0;
 
 LRESULT CALLBACK ObserveMainListDestruction(HWND list, UINT message, WPARAM wparam,
@@ -2306,13 +2379,6 @@ DWORD main_error_code = ERROR_SUCCESS;
 std::vector<std::wstring> main_csv_headers;
 std::vector<std::vector<std::wstring>> main_csv_rows;
 CsvSaveResult main_csv_result{false, ERROR_SUCCESS};
-std::chrono::steady_clock::time_point main_sample_time{};
-int main_sample_index = 0;
-
-std::chrono::steady_clock::time_point MainSampleTime() {
-    return main_sample_time + std::chrono::seconds(main_sample_index++);
-}
-
 TrafficAggregator* main_reorder_traffic = nullptr;
 int main_menu_refreshes = 0;
 int main_confirmation_refreshes = 0;
@@ -2382,14 +2448,16 @@ void TestMainWindowRoutesProcessActionsAndExportsVisibleRows() {
     FakeProcessActionApi action_api;
     action_api.creation_time_100ns = 77;
     ProcessActions actions(action_api);
-    FakeNetworkInterfaceApi network_api;
-    NetworkRateMonitor network(network_api);
     traffic.Add({{{4242, 77}, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls},
                  L"zeta.exe", TrafficDirection::Send, 1024});
     traffic.Add({{{4243, 88}, TransportProtocol::Udp, ApplicationProtocol::Dns},
                  L"alpha.exe", TrafficDirection::Receive, 2048});
-    MainWindowDependencies dependencies{&actions, &network, ChooseMainMenu,
-        ConfirmMainTerminate, CaptureMainError, CaptureMainCsv};
+    MainWindowDependencies dependencies{};
+    dependencies.process_actions = &actions;
+    dependencies.choose_menu_command = ChooseMainMenu;
+    dependencies.confirm_termination = ConfirmMainTerminate;
+    dependencies.present_error = CaptureMainError;
+    dependencies.save_csv = CaptureMainCsv;
     HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections,
                                    cache, etw, dependencies);
     CHECK_EQ(window != nullptr, true);
@@ -2492,8 +2560,6 @@ void TestMainWindowMouseActionKeepsClickedProcessAcrossMenuAndConfirmationRefres
     FakeProcessActionApi action_api;
     action_api.creation_time_100ns = 77;
     ProcessActions actions(action_api);
-    FakeNetworkInterfaceApi network_api;
-    NetworkRateMonitor network(network_api);
     traffic.Add({{{4242, 77}, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls},
                  L"zeta.exe", TrafficDirection::Send, 1});
     traffic.Add({{{4243, 88}, TransportProtocol::Tcp, ApplicationProtocol::Http},
@@ -2504,8 +2570,12 @@ void TestMainWindowMouseActionKeepsClickedProcessAcrossMenuAndConfirmationRefres
     main_confirm_calls = 0;
     main_confirm_result = true;
     main_menu_command = 1007;
-    MainWindowDependencies dependencies{&actions, &network, ChooseMainMenuAfterRefresh,
-        ConfirmMainTerminateAfterRefresh, CaptureMainError, CaptureMainCsv};
+    MainWindowDependencies dependencies{};
+    dependencies.process_actions = &actions;
+    dependencies.choose_menu_command = ChooseMainMenuAfterRefresh;
+    dependencies.confirm_termination = ConfirmMainTerminateAfterRefresh;
+    dependencies.present_error = CaptureMainError;
+    dependencies.save_csv = CaptureMainCsv;
     HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections,
                                    cache, etw, dependencies);
     CHECK_EQ(window != nullptr, true);
@@ -2550,7 +2620,7 @@ void TestMainWindowMouseActionKeepsClickedProcessAcrossMenuAndConfirmationRefres
     while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
 }
 
-void TestMainWindowShowsNetworkRatesAndRecoversAfterError() {
+void TestMainWindowShowsProcessRateTotals() {
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
     CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
     TrafficAggregator traffic;
@@ -2558,19 +2628,8 @@ void TestMainWindowShowsNetworkRatesAndRecoversAfterError() {
     ProcessInfoCache cache;
     FakeEtwSessionApi etw_api;
     EtwMonitor etw(traffic, connections, cache, etw_api);
-    FakeNetworkInterfaceApi network_api;
-    network_api.results = {{ERROR_SUCCESS, {MakeNetworkInterface(1, 1000, 2000)}},
-                           {ERROR_SUCCESS, {MakeNetworkInterface(1, 2024, 2512)}},
-                           {ERROR_ACCESS_DENIED, {}},
-                           {ERROR_SUCCESS, {MakeNetworkInterface(1, 3048, 3024)}}};
-    NetworkRateMonitor network(network_api);
-    MainWindowDependencies dependencies{};
-    dependencies.network_rate_monitor = &network;
-    main_sample_time = std::chrono::steady_clock::now();
-    main_sample_index = 0;
-    dependencies.sample_time = MainSampleTime;
     HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections,
-                                   cache, etw, dependencies);
+                                   cache, etw);
     CHECK_EQ(window != nullptr, true);
     if (window == nullptr) { return; }
     HWND status = FindWindowExW(window, nullptr, STATUSCLASSNAMEW, nullptr);
@@ -2581,19 +2640,8 @@ void TestMainWindowShowsNetworkRatesAndRecoversAfterError() {
         value.resize(std::wcslen(value.c_str()));
         return value;
     };
-    CHECK_EQ(network_api.query_index, 0U);
-    SendMessageW(window, WM_TIMER, 1, 0);
-    CHECK_EQ(network_api.query_index, 1U);
-    CHECK_EQ(status_text().find(L"总网速：↑ 0 B/s ↓ 0 B/s 合计 0 B/s") != std::wstring::npos, true);
-    SendMessageW(window, WM_COMMAND, MAKEWPARAM(1002, BN_CLICKED), 0);
-    SendMessageW(window, WM_TIMER, 1, 0);
-    CHECK_EQ(network_api.query_index, 2U);
-    CHECK_EQ(status_text().find(L"总网速：↑ 512 B/s ↓ 1 KB/s 合计 1.5 KB/s") != std::wstring::npos, true);
-    SendMessageW(window, WM_TIMER, 1, 0);
-    CHECK_EQ(status_text().find(L"总网速：不可用（错误 5）") != std::wstring::npos, true);
-    SendMessageW(window, WM_TIMER, 1, 0);
-    CHECK_EQ(network_api.query_index, 4U);
-    CHECK_EQ(status_text().find(L"总网速：↑ 256 B/s ↓ 512 B/s 合计 768 B/s") != std::wstring::npos, true);
+    CHECK_EQ(status_text().find(L"进程总网速：↑ 0 B/s ↓ 0 B/s 合计 0 B/s") !=
+                 std::wstring::npos, true);
     DestroyWindow(window);
     MSG message{};
     while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
@@ -2607,8 +2655,6 @@ void TestMainWindowKeepsManualScrollAndResetsForSortAndFilter() {
     ProcessInfoCache cache;
     FakeEtwSessionApi etw_api;
     EtwMonitor etw(traffic, connections, cache, etw_api);
-    FakeNetworkInterfaceApi network_api;
-    NetworkRateMonitor network(network_api);
     for (int index = 0; index < 80; ++index) {
         traffic.Add({{{static_cast<std::uint32_t>(5000 + index),
                        static_cast<std::uint64_t>(100 + index)},
@@ -2616,10 +2662,8 @@ void TestMainWindowKeepsManualScrollAndResetsForSortAndFilter() {
                      L"proc" + std::to_wstring(100 + index) + L".exe",
                      TrafficDirection::Send, 1});
     }
-    MainWindowDependencies dependencies{};
-    dependencies.network_rate_monitor = &network;
     HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections,
-                                   cache, etw, dependencies);
+                                   cache, etw);
     CHECK_EQ(window != nullptr, true);
     if (window == nullptr) { return; }
     SetWindowPos(window, nullptr, 0, 0, 900, 240,
@@ -3655,132 +3699,6 @@ void TestWriteCsvFileWritesExactBytesToTemporaryFile() {
     CHECK_EQ(DeleteFileW(path.c_str()) != FALSE, true);
 }
 
-void TestNetworkRatesSumOnlyUpNonLoopbackInterfaces() {
-    FakeNetworkInterfaceApi api;
-    api.results = {
-        {ERROR_SUCCESS,
-         {MakeNetworkInterface(1, 100, 50), MakeNetworkInterface(2, 400, 200),
-          MakeNetworkInterface(3, 900, 900, IfOperStatusDown),
-          MakeNetworkInterface(4, 800, 800, IfOperStatusUp, IF_TYPE_SOFTWARE_LOOPBACK)}},
-        {ERROR_SUCCESS,
-         {MakeNetworkInterface(1, 1100, 550), MakeNetworkInterface(2, 400, 200),
-          MakeNetworkInterface(3, 1900, 1900, IfOperStatusDown),
-          MakeNetworkInterface(4, 1800, 1800, IfOperStatusUp, IF_TYPE_SOFTWARE_LOOPBACK)}},
-    };
-    NetworkRateMonitor monitor(api);
-    const auto t0 = std::chrono::steady_clock::time_point{};
-
-    const NetworkRateSnapshot initial = monitor.Snapshot(t0);
-    const NetworkRateSnapshot rates = monitor.Snapshot(t0 + std::chrono::seconds(2));
-
-    CHECK_EQ(initial.error, static_cast<DWORD>(ERROR_SUCCESS));
-    CHECK_EQ(initial.received_bytes_per_second, 0.0);
-    CHECK_EQ(initial.sent_bytes_per_second, 0.0);
-    CHECK_EQ(rates.error, static_cast<DWORD>(ERROR_SUCCESS));
-    CHECK_EQ(rates.received_bytes_per_second, 500.0);
-    CHECK_EQ(rates.sent_bytes_per_second, 250.0);
-}
-
-void TestNetworkRatesSumMultipleValidInterfaces() {
-    FakeNetworkInterfaceApi api;
-    api.results = {
-        {ERROR_SUCCESS, {MakeNetworkInterface(1, 100, 50), MakeNetworkInterface(2, 400, 200)}},
-        {ERROR_SUCCESS, {MakeNetworkInterface(1, 1100, 550), MakeNetworkInterface(2, 2400, 1200)}},
-    };
-    NetworkRateMonitor monitor(api);
-    const auto t0 = std::chrono::steady_clock::time_point{};
-
-    monitor.Snapshot(t0);
-    const NetworkRateSnapshot rates = monitor.Snapshot(t0 + std::chrono::seconds(2));
-
-    CHECK_EQ(rates.received_bytes_per_second, 1500.0);
-    CHECK_EQ(rates.sent_bytes_per_second, 750.0);
-}
-
-void TestNetworkRatesStartNewAndReturnedInterfacesAtZero() {
-    FakeNetworkInterfaceApi api;
-    api.results = {
-        {ERROR_SUCCESS, {MakeNetworkInterface(1, 100, 50)}},
-        {ERROR_SUCCESS, {MakeNetworkInterface(1, 1100, 550), MakeNetworkInterface(2, 100, 50)}},
-        {ERROR_SUCCESS, {MakeNetworkInterface(2, 200, 100)}},
-        {ERROR_SUCCESS, {MakeNetworkInterface(1, 2100, 1050), MakeNetworkInterface(2, 300, 150)}},
-    };
-    NetworkRateMonitor monitor(api);
-    const auto t0 = std::chrono::steady_clock::time_point{};
-
-    monitor.Snapshot(t0);
-    const NetworkRateSnapshot new_interface = monitor.Snapshot(t0 + std::chrono::seconds(1));
-    const NetworkRateSnapshot removed_interface = monitor.Snapshot(t0 + std::chrono::seconds(2));
-    const NetworkRateSnapshot returned_interface = monitor.Snapshot(t0 + std::chrono::seconds(3));
-
-    CHECK_EQ(new_interface.received_bytes_per_second, 1000.0);
-    CHECK_EQ(new_interface.sent_bytes_per_second, 500.0);
-    CHECK_EQ(removed_interface.received_bytes_per_second, 100.0);
-    CHECK_EQ(removed_interface.sent_bytes_per_second, 50.0);
-    CHECK_EQ(returned_interface.received_bytes_per_second, 100.0);
-    CHECK_EQ(returned_interface.sent_bytes_per_second, 50.0);
-}
-
-void TestNetworkRatesKeepLastValidBaselineForRollbackAndInvalidTimes() {
-    FakeNetworkInterfaceApi api;
-    api.results = {
-        {ERROR_SUCCESS, {MakeNetworkInterface(1, 100, 50)}},
-        {ERROR_SUCCESS, {MakeNetworkInterface(1, 50, 25)}},
-        {ERROR_SUCCESS, {MakeNetworkInterface(1, 150, 75)}},
-        {ERROR_SUCCESS, {MakeNetworkInterface(1, 175, 80)}},
-        {ERROR_SUCCESS, {MakeNetworkInterface(1, 1100, 550)}},
-    };
-    NetworkRateMonitor monitor(api);
-    const auto t0 = std::chrono::steady_clock::time_point{};
-
-    monitor.Snapshot(t0);
-    const NetworkRateSnapshot rollback = monitor.Snapshot(t0 + std::chrono::seconds(1));
-    const NetworkRateSnapshot equal_time = monitor.Snapshot(t0);
-    const NetworkRateSnapshot earlier_time = monitor.Snapshot(t0 - std::chrono::seconds(1));
-    const NetworkRateSnapshot recovered = monitor.Snapshot(t0 + std::chrono::seconds(2));
-
-    CHECK_EQ(rollback.received_bytes_per_second, 0.0);
-    CHECK_EQ(rollback.sent_bytes_per_second, 0.0);
-    CHECK_EQ(equal_time.received_bytes_per_second, 0.0);
-    CHECK_EQ(equal_time.sent_bytes_per_second, 0.0);
-    CHECK_EQ(earlier_time.received_bytes_per_second, 0.0);
-    CHECK_EQ(earlier_time.sent_bytes_per_second, 0.0);
-    CHECK_EQ(recovered.received_bytes_per_second, 500.0);
-    CHECK_EQ(recovered.sent_bytes_per_second, 250.0);
-}
-
-void TestNetworkRatesPreserveBaselinesAcrossApiFailures() {
-    FakeNetworkInterfaceApi api;
-    api.results = {
-        {ERROR_SUCCESS, {MakeNetworkInterface(1, 100, 50)}},
-        {ERROR_ACCESS_DENIED, {}},
-        {ERROR_SUCCESS, {MakeNetworkInterface(1, 1100, 550)}},
-    };
-    NetworkRateMonitor monitor(api);
-    const auto t0 = std::chrono::steady_clock::time_point{};
-
-    monitor.Snapshot(t0);
-    const NetworkRateSnapshot failed = monitor.Snapshot(t0 + std::chrono::seconds(1));
-    const NetworkRateSnapshot recovered = monitor.Snapshot(t0 + std::chrono::seconds(2));
-
-    CHECK_EQ(failed.error, static_cast<DWORD>(ERROR_ACCESS_DENIED));
-    CHECK_EQ(failed.received_bytes_per_second, 0.0);
-    CHECK_EQ(failed.sent_bytes_per_second, 0.0);
-    CHECK_EQ(recovered.error, static_cast<DWORD>(ERROR_SUCCESS));
-    CHECK_EQ(recovered.received_bytes_per_second, 500.0);
-    CHECK_EQ(recovered.sent_bytes_per_second, 250.0);
-}
-
-void TestDefaultNetworkRateMonitorQueriesInterfaces() {
-    NetworkRateMonitor monitor;
-
-    const NetworkRateSnapshot snapshot = monitor.Snapshot(std::chrono::steady_clock::now());
-
-    CHECK_EQ(snapshot.error, static_cast<DWORD>(ERROR_SUCCESS));
-    CHECK_EQ(snapshot.received_bytes_per_second, 0.0);
-    CHECK_EQ(snapshot.sent_bytes_per_second, 0.0);
-}
-
 void TestRevealExecutableValidatesInstanceAndSelectsQuotedPath() {
     FakeProcessActionApi api;
     api.creation_time_100ns = 0x1122334455667788ULL;
@@ -4133,6 +4051,7 @@ int main(int argc, char** argv) {
     TestTrafficFormatting();
     TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically();
     TestVisibleRowsFilterWithoutMutatingSnapshotAndAttachLiveness();
+    TestProcessRateTotalsSumEveryCapturedProcess();
     TestVisibleRowsDefaultOrderUsesCombinedSpeedDescending();
     TestVisibleRowsUsesInvariantUnicodeCaseInsensitiveFilter();
     TestProcessForVisibleRowReturnsProcessInstanceIdentity();
@@ -4143,19 +4062,22 @@ int main(int argc, char** argv) {
     TestProcessInfoCacheUsesCreationTimeOnRealCacheHits();
     TestProcessInfoFallbackDetectsAccessiblePidReuseWithinEightEvents();
     TestProcessInfoCreationQueryFailureEventuallyDetectsPidReuse();
+    TestSingleInstanceGuardRejectsSecondOwnerAndReleasesName();
     TestEtwMonitorStartsOneConfiguredConsumer();
     TestEtwMonitorStopsOnlyOwnedResourcesAndStopIsIdempotent();
     TestEtwMonitorExposesStartTraceFailureWithoutOpeningConsumer();
+    TestEtwMonitorCleansOnlyLegacyNetAssessSessionsAndRetriesResourceFailure();
     TestEtwMonitorCleansOwnedSessionWhenOpenTraceFails();
     TestEtwMonitorCleansOwnedResourcesWhenConsumerFails();
     TestEtwMonitorDoesNotReportSuccessfulPendingStopCodesAsErrors();
     TestEtwMonitorStopPublishesStateOnlyAfterTransitionLock();
     TestEtwMonitorBadLengthStopReleasesOwnershipButRetainsValidCounters();
     TestMainWindowRetriesFailedStopInsteadOfStartingAnotherSession();
+    TestMainWindowExplainsEtwLoggerExhaustion();
     TestMainWindowCreatesOperationalToolbarAndSortArrow();
     TestMainWindowRoutesProcessActionsAndExportsVisibleRows();
     TestMainWindowMouseActionKeepsClickedProcessAcrossMenuAndConfirmationRefresh();
-    TestMainWindowShowsNetworkRatesAndRecoversAfterError();
+    TestMainWindowShowsProcessRateTotals();
     TestMainWindowKeepsManualScrollAndResetsForSortAndFilter();
     TestConnectionCreationPreservesErrorAcrossDestruction();
     TestConnectionCreationDoesNotUseStaleSubclassFailureError();
@@ -4181,12 +4103,6 @@ int main(int argc, char** argv) {
     TestCsvBuildEmptyTableContainsOnlyUtf8Bom();
     TestCsvBuildRejectsUnevenRows();
     TestWriteCsvFileWritesExactBytesToTemporaryFile();
-    TestNetworkRatesSumOnlyUpNonLoopbackInterfaces();
-    TestNetworkRatesSumMultipleValidInterfaces();
-    TestNetworkRatesStartNewAndReturnedInterfacesAtZero();
-    TestNetworkRatesKeepLastValidBaselineForRollbackAndInvalidTimes();
-    TestNetworkRatesPreserveBaselinesAcrossApiFailures();
-    TestDefaultNetworkRateMonitorQueriesInterfaces();
     TestRevealExecutableValidatesInstanceAndSelectsQuotedPath();
     TestRevealExecutableRejectsReusedPidBeforePathOrShellAction();
     TestRevealExecutablePropagatesBoundaryFailures();
