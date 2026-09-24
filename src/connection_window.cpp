@@ -24,6 +24,8 @@ constexpr wchar_t kWindowClassName[] = L"NetAssessConnectionWindow";
 constexpr int kPortFilterId = 101;
 constexpr int kIpFilterId = 102;
 constexpr int kExportId = 103;
+constexpr int kTcpFilterId = 104;
+constexpr int kUdpFilterId = 105;
 constexpr std::array<std::wstring_view, 12> kColumnNames{
     L"状态", L"方向", L"传输层协议", L"推断应用协议",
     L"本地地址", L"本地端口", L"远端地址", L"远端端口",
@@ -110,7 +112,6 @@ public:
 
 private:
     struct ListPane {
-        TransportProtocol transport{};
         HWND list{};
         ListScrollState scroll_state;
         ConnectionSortColumn sort_column{ConnectionSortColumn::CombinedSpeed};
@@ -138,14 +139,7 @@ private:
             RefreshSnapshot();
             return 0;
         case WM_NOTIFY:
-            if (const auto* notification = reinterpret_cast<NMHDR*>(lparam);
-                notification != nullptr && notification->hwndFrom == tab_control_ &&
-                notification->code == TCN_SELCHANGE) {
-                const int selected = TabCtrl_GetCurSel(tab_control_);
-                if (selected >= 0) { SwitchPane(static_cast<std::size_t>(selected)); }
-            } else {
-                HandleNotify(notification);
-            }
+            HandleNotify(reinterpret_cast<NMHDR*>(lparam));
             return 0;
         case WM_COMMAND:
             if (reinterpret_cast<HWND>(lparam) == ip_edit_ && HIWORD(wparam) == EN_CHANGE) {
@@ -156,6 +150,10 @@ private:
             } else if (reinterpret_cast<HWND>(lparam) == export_button_ &&
                        HIWORD(wparam) == BN_CLICKED) {
                 ExportRows();
+            } else if ((reinterpret_cast<HWND>(lparam) == tcp_checkbox_ ||
+                        reinterpret_cast<HWND>(lparam) == udp_checkbox_) &&
+                       HIWORD(wparam) == BN_CLICKED) {
+                ApplyProtocolFilter(reinterpret_cast<HWND>(lparam));
             }
             return 0;
         case WM_SIZE:
@@ -195,68 +193,70 @@ private:
                                    0, 0, 0, 0, window_, reinterpret_cast<HMENU>(
                                        static_cast<INT_PTR>(id)), instance, nullptr);
         };
-        ip_label_ = create_control(L"STATIC", L"IP", SS_LEFT, 0);
+        auto create_edit = [&](int id) {
+            return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                0, 0, 0, 0, window_, reinterpret_cast<HMENU>(
+                    static_cast<INT_PTR>(id)), instance, nullptr);
+        };
+        ip_label_ = create_control(L"STATIC", L"IP 地址", SS_LEFT | SS_CENTERIMAGE, 0);
         if (ip_label_ == nullptr) { return false; }
-        port_label_ = create_control(L"STATIC", L"端口", SS_LEFT, 0);
+        port_label_ = create_control(L"STATIC", L"端口", SS_LEFT | SS_CENTERIMAGE, 0);
         if (port_label_ == nullptr) { return false; }
-        port_edit_ = create_control(L"EDIT", L"", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                                    kPortFilterId);
+        port_edit_ = create_edit(kPortFilterId);
         if (port_edit_ == nullptr) { return false; }
-        ip_edit_ = create_control(L"EDIT", L"", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                                  kIpFilterId);
+        ip_edit_ = create_edit(kIpFilterId);
         if (ip_edit_ == nullptr) { return false; }
         export_button_ = create_control(L"BUTTON", L"导出 CSV", WS_TABSTOP | BS_PUSHBUTTON,
                                         kExportId);
         if (export_button_ == nullptr) { return false; }
-        tab_control_ = create_control(WC_TABCONTROLW, L"", WS_TABSTOP, 0);
-        if (tab_control_ == nullptr) { return false; }
-        panes_[0].transport = TransportProtocol::Tcp;
-        panes_[1].transport = TransportProtocol::Udp;
-        constexpr std::array<std::wstring_view, 2> tab_names{L"TCP 列表", L"UDP 列表"};
-        for (int index = 0; index < static_cast<int>(tab_names.size()); ++index) {
-            TCITEMW item{};
-            item.mask = TCIF_TEXT;
-            item.pszText = const_cast<wchar_t*>(tab_names[static_cast<std::size_t>(index)].data());
-            if (TabCtrl_InsertItem(tab_control_, index, &item) == -1) { return false; }
-        }
-        for (std::size_t pane_index = 0; pane_index < panes_.size(); ++pane_index) {
-            ListPane& pane = panes_[pane_index];
-            pane.list = CreateWindowExW(
-                WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-                WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS,
-                0, 0, 0, 0, window_, nullptr, instance, nullptr);
-            if (pane.list == nullptr) { return false; }
-            SendMessageW(pane.list, WM_SETFONT,
-                         reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
-            ListView_SetExtendedListViewStyleEx(
-                pane.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER,
-                LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-            for (int column_index = 0;
-                 column_index < static_cast<int>(kColumnNames.size()); ++column_index) {
-                LVCOLUMNW column{};
-                column.mask = LVCF_TEXT | LVCF_SUBITEM;
-                column.pszText = const_cast<wchar_t*>(
-                    kColumnNames[static_cast<std::size_t>(column_index)].data());
-                column.iSubItem = column_index;
-                if (ListView_InsertColumn(pane.list, column_index, &column) == -1) {
-                    return false;
-                }
-            }
-            SetLastError(ERROR_SUCCESS);
-            if (!SetWindowSubclass(pane.list, ListProcedure,
-                                   static_cast<UINT_PTR>(pane_index + 1),
-                                   reinterpret_cast<DWORD_PTR>(this))) {
-                creation_error_ = CreationError();
+        protocol_label_ = create_control(L"STATIC", L"协议", SS_LEFT | SS_CENTERIMAGE, 0);
+        if (protocol_label_ == nullptr) { return false; }
+        tcp_checkbox_ = create_control(L"BUTTON", L"TCP",
+            WS_TABSTOP | BS_AUTOCHECKBOX, kTcpFilterId);
+        if (tcp_checkbox_ == nullptr) { return false; }
+        udp_checkbox_ = create_control(L"BUTTON", L"UDP",
+            WS_TABSTOP | BS_AUTOCHECKBOX, kUdpFilterId);
+        if (udp_checkbox_ == nullptr) { return false; }
+        SendMessageW(tcp_checkbox_, BM_SETCHECK, BST_CHECKED, 0);
+        SendMessageW(udp_checkbox_, BM_SETCHECK, BST_CHECKED, 0);
+        SendMessageW(ip_edit_, EM_SETCUEBANNER, TRUE,
+                     reinterpret_cast<LPARAM>(L"本机或对端 IP"));
+        SendMessageW(port_edit_, EM_SETCUEBANNER, TRUE,
+                     reinterpret_cast<LPARAM>(L"本机或对端端口"));
+
+        pane_.list = CreateWindowExW(
+            WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
+            0, 0, 0, 0, window_, nullptr, instance, nullptr);
+        if (pane_.list == nullptr) { return false; }
+        SendMessageW(pane_.list, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+        ListView_SetExtendedListViewStyleEx(
+            pane_.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER,
+            LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        for (int column_index = 0;
+             column_index < static_cast<int>(kColumnNames.size()); ++column_index) {
+            LVCOLUMNW column{};
+            column.mask = LVCF_TEXT | LVCF_SUBITEM;
+            column.pszText = const_cast<wchar_t*>(
+                kColumnNames[static_cast<std::size_t>(column_index)].data());
+            column.iSubItem = column_index;
+            if (ListView_InsertColumn(pane_.list, column_index, &column) == -1) {
                 return false;
             }
         }
-        for (HWND control : {ip_label_, port_label_, port_edit_, ip_edit_, export_button_}) {
+        SetLastError(ERROR_SUCCESS);
+        if (!SetWindowSubclass(pane_.list, ListProcedure, 1,
+                               reinterpret_cast<DWORD_PTR>(this))) {
+            creation_error_ = CreationError();
+            return false;
+        }
+        for (HWND control : {ip_label_, port_label_, port_edit_, ip_edit_, protocol_label_,
+                             tcp_checkbox_, udp_checkbox_, export_button_}) {
             SendMessageW(control, WM_SETFONT,
                          reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
         }
-        SendMessageW(tab_control_, WM_SETFONT,
-                     reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
-        SwitchPane(0);
         UpdateColumnWidths();
         LayoutControls();
         return true;
@@ -266,17 +266,15 @@ private:
         constexpr std::array<int, 12> column_widths{
             88, 70, 92, 170, 190, 82, 190, 82, 105, 105, 105, 105,
         };
-        for (const ListPane& pane : panes_) {
-            for (int index = 0; index < static_cast<int>(column_widths.size()); ++index) {
-                ListView_SetColumnWidth(
-                    pane.list, index,
-                    win32_dpi::Scale(column_widths[static_cast<std::size_t>(index)], dpi_));
-            }
+        for (int index = 0; index < static_cast<int>(column_widths.size()); ++index) {
+            ListView_SetColumnWidth(
+                pane_.list, index,
+                win32_dpi::Scale(column_widths[static_cast<std::size_t>(index)], dpi_));
         }
     }
 
     void LayoutControls() const {
-        if (tab_control_ == nullptr || export_button_ == nullptr) {
+        if (pane_.list == nullptr || export_button_ == nullptr) {
             return;
         }
         RECT client{};
@@ -290,34 +288,18 @@ private:
             MoveWindow(control, x, margin, scaled_width, control_height, TRUE);
             x += scaled_width + gap;
         };
-        place(ip_label_, 20);
-        place(ip_edit_, 200);
+        place(ip_label_, 48);
+        place(ip_edit_, 220);
         place(port_label_, 36);
-        place(port_edit_, 90);
+        place(port_edit_, 130);
+        place(protocol_label_, 36);
+        place(tcp_checkbox_, 55);
+        place(udp_checkbox_, 55);
         place(export_button_, 100);
         const int list_top = margin + control_height + margin;
-        MoveWindow(tab_control_, margin, list_top,
+        MoveWindow(pane_.list, margin, list_top,
                    std::max(0, static_cast<int>(client.right) - margin * 2),
                    std::max(0, static_cast<int>(client.bottom) - list_top - margin), TRUE);
-        RECT page{};
-        GetClientRect(tab_control_, &page);
-        TabCtrl_AdjustRect(tab_control_, FALSE, &page);
-        MapWindowPoints(tab_control_, window_, reinterpret_cast<POINT*>(&page), 2);
-        for (const ListPane& pane : panes_) {
-            MoveWindow(pane.list, page.left, page.top,
-                       std::max(0, static_cast<int>(page.right - page.left)),
-                       std::max(0, static_cast<int>(page.bottom - page.top)), TRUE);
-        }
-    }
-
-    void SwitchPane(std::size_t index) {
-        if (index >= panes_.size()) { return; }
-        active_pane_ = index;
-        TabCtrl_SetCurSel(tab_control_, static_cast<int>(index));
-        for (std::size_t pane_index = 0; pane_index < panes_.size(); ++pane_index) {
-            ShowWindow(panes_[pane_index].list,
-                       pane_index == active_pane_ ? SW_SHOW : SW_HIDE);
-        }
     }
 
     static LRESULT CALLBACK ListProcedure(HWND list, UINT message, WPARAM wparam,
@@ -342,10 +324,7 @@ private:
     }
 
     ListPane* PaneForList(HWND list) {
-        for (ListPane& pane : panes_) {
-            if (pane.list == list) { return &pane; }
-        }
-        return nullptr;
+        return pane_.list == list ? &pane_ : nullptr;
     }
 
     static std::wstring EditText(HWND edit) {
@@ -376,25 +355,30 @@ private:
         } else {
             filter_.ip = EditText(ip_edit_);
         }
-        for (ListPane& pane : panes_) { pane.scroll_state.ResetToAutoTop(); }
+        pane_.scroll_state.ResetToAutoTop();
+        RebuildFilteredRows();
+    }
+
+    void ApplyProtocolFilter(HWND changed_checkbox) {
+        const bool tcp_checked = SendMessageW(tcp_checkbox_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        const bool udp_checked = SendMessageW(udp_checkbox_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        if (!tcp_checked && !udp_checked) {
+            SendMessageW(changed_checkbox, BM_SETCHECK, BST_CHECKED, 0);
+        }
+        pane_.scroll_state.ResetToAutoTop();
         RebuildFilteredRows();
     }
 
     void RebuildFilteredRows() {
-        const auto filtered = FilterConnectionRows(raw_rows_, filter_);
-        for (ListPane& pane : panes_) { pane.rows.clear(); }
-        for (const ConnectionDisplayRow& row : filtered) {
-            for (ListPane& pane : panes_) {
-                if (row.connection.key.transport == pane.transport) {
-                    pane.rows.push_back(row);
-                    break;
-                }
-            }
-        }
-        for (ListPane& pane : panes_) {
-            SortConnectionRows(pane.rows, pane.sort_column, pane.ascending);
-            ReconcileRows(pane);
-        }
+        pane_.rows = FilterConnectionRows(raw_rows_, filter_);
+        const bool show_tcp = SendMessageW(tcp_checkbox_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        const bool show_udp = SendMessageW(udp_checkbox_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        std::erase_if(pane_.rows, [&](const ConnectionDisplayRow& row) {
+            return (row.connection.key.transport == TransportProtocol::Tcp && !show_tcp) ||
+                   (row.connection.key.transport == TransportProtocol::Udp && !show_udp);
+        });
+        SortConnectionRows(pane_.rows, pane_.sort_column, pane_.ascending);
+        ReconcileRows(pane_);
     }
 
     void ExportRows() {
@@ -403,9 +387,8 @@ private:
             headers[index] = kColumnNames[index];
         }
         std::vector<std::vector<std::wstring>> data;
-        const ListPane& pane = panes_[active_pane_];
-        data.reserve(pane.rows.size());
-        for (const ConnectionDisplayRow& row : pane.rows) {
+        data.reserve(pane_.rows.size());
+        for (const ConnectionDisplayRow& row : pane_.rows) {
             data.push_back(ConnectionCsvCells(row));
         }
         const CsvSaveResult result = SaveCsvWithDialog(window_, L"连接明细.csv", headers, data);
@@ -584,19 +567,20 @@ private:
     ConnectionAggregator& aggregator_;
     ProcessInfoCache& process_cache_;
     HWND window_{};
-    HWND tab_control_{};
     HWND ip_label_{};
     HWND ip_edit_{};
     HWND port_label_{};
     HWND port_edit_{};
+    HWND protocol_label_{};
+    HWND tcp_checkbox_{};
+    HWND udp_checkbox_{};
     HWND export_button_{};
     ConnectionErrorPresenter error_presenter_{};
     ConnectionFilter filter_;
     bool invalid_port_reported_{};
     DWORD creation_error_{};
     UINT dpi_{win32_dpi::kDefaultDpi};
-    std::array<ListPane, 2> panes_{};
-    std::size_t active_pane_{};
+    ListPane pane_;
     std::vector<ConnectionDisplayRow> raw_rows_;
 };
 

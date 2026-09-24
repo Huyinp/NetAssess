@@ -2852,6 +2852,8 @@ void TestConnectionWindowCreatesFilterAndExportToolbar() {
 
     int edit_count = 0;
     bool has_export_button = false;
+    bool has_ip_label = false;
+    bool has_protocol_label = false;
     HWND list = nullptr;
     for (HWND child = GetWindow(created.window, GW_CHILD); child != nullptr;
          child = GetWindow(child, GW_HWNDNEXT)) {
@@ -2862,11 +2864,21 @@ void TestConnectionWindowCreatesFilterAndExportToolbar() {
         if (std::wstring_view(class_name) == L"Edit") { ++edit_count; }
         if (std::wstring_view(class_name) == L"Button" &&
             std::wstring_view(title) == L"导出 CSV") { has_export_button = true; }
+        if (std::wstring_view(class_name) == L"Static" &&
+            std::wstring_view(title) == L"IP 地址") { has_ip_label = true; }
+        if (std::wstring_view(class_name) == L"Static" &&
+            std::wstring_view(title) == L"协议") { has_protocol_label = true; }
         if (std::wstring_view(class_name) == WC_LISTVIEWW) { list = child; }
     }
     CHECK_EQ(edit_count, 2);
     CHECK_EQ(has_export_button, true);
+    CHECK_EQ(has_ip_label, true);
+    CHECK_EQ(has_protocol_label, true);
     CHECK_EQ(list != nullptr, true);
+    CHECK_EQ((GetWindowLongPtrW(GetDlgItem(created.window, 102), GWL_EXSTYLE) &
+              WS_EX_CLIENTEDGE) != 0, true);
+    CHECK_EQ((GetWindowLongPtrW(GetDlgItem(created.window, 101), GWL_EXSTYLE) &
+              WS_EX_CLIENTEDGE) != 0, true);
     SetWindowPos(created.window, nullptr, 0, 0, 900, 240,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     RECT client{};
@@ -2890,8 +2902,8 @@ void TestConnectionWindowCreatesFilterAndExportToolbar() {
     DestroyWindow(created.window);
 }
 
-void TestConnectionWindowSeparatesTcpAndUdpIntoTabs() {
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES};
+void TestConnectionWindowFiltersTcpAndUdpWithCheckboxes() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
     CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
     ConnectionAggregator connections;
     ProcessInfoCache cache;
@@ -2901,7 +2913,8 @@ void TestConnectionWindowSeparatesTcpAndUdpIntoTabs() {
         ApplicationProtocol::HttpsTls, 50000, 443), L"test.exe",
         TrafficDirection::Send, 128, now});
     connections.Add({MakeConnectionKey(process, TransportProtocol::Udp,
-        ApplicationProtocol::Dns, 53000, 53), L"test.exe",
+        ApplicationProtocol::Dns, 53000, 53,
+        MakeIpv4Address(10, 0, 0, 2), MakeIpv4Address(1, 1, 1, 1)), L"test.exe",
         TrafficDirection::Receive, 64, now});
     const auto created = CreateConnectionWindow(GetModuleHandleW(nullptr), nullptr,
         process, L"test.exe", connections, cache);
@@ -2916,20 +2929,53 @@ void TestConnectionWindowSeparatesTcpAndUdpIntoTabs() {
          child = FindWindowExW(created.window, child, WC_LISTVIEWW, nullptr)) {
         lists.push_back(child);
     }
-    CHECK_EQ(tab != nullptr, true);
-    CHECK_EQ(lists.size(), 2U);
-    if (tab != nullptr && lists.size() == 2) {
-        CHECK_EQ(TabCtrl_GetItemCount(tab), 2);
-        CHECK_EQ(ListView_GetItemCount(lists[0]), 1);
-        CHECK_EQ(ListView_GetItemCount(lists[1]), 1);
-        CHECK_EQ((GetWindowLongPtrW(lists[0], GWL_STYLE) & WS_VISIBLE) != 0, true);
-        CHECK_EQ((GetWindowLongPtrW(lists[1], GWL_STYLE) & WS_VISIBLE) != 0, false);
+    HWND tcp = nullptr;
+    HWND udp = nullptr;
+    for (HWND child = FindWindowExW(created.window, nullptr, L"Button", nullptr);
+         child != nullptr;
+         child = FindWindowExW(created.window, child, L"Button", nullptr)) {
+        wchar_t text[32]{};
+        GetWindowTextW(child, text, static_cast<int>(std::size(text)));
+        if (std::wstring_view(text) == L"TCP") { tcp = child; }
+        if (std::wstring_view(text) == L"UDP") { udp = child; }
+    }
+    CHECK_EQ(tab == nullptr, true);
+    CHECK_EQ(lists.size(), 1U);
+    CHECK_EQ(tcp != nullptr, true);
+    CHECK_EQ(udp != nullptr, true);
+    if (lists.size() == 1 && tcp != nullptr && udp != nullptr) {
+        HWND list = lists[0];
+        CHECK_EQ(SendMessageW(tcp, BM_GETCHECK, 0, 0), BST_CHECKED);
+        CHECK_EQ(SendMessageW(udp, BM_GETCHECK, 0, 0), BST_CHECKED);
+        CHECK_EQ(ListView_GetItemCount(list), 2);
 
-        TabCtrl_SetCurSel(tab, 1);
-        NMHDR changed{tab, 0, TCN_SELCHANGE};
-        SendMessageW(created.window, WM_NOTIFY, 0, reinterpret_cast<LPARAM>(&changed));
-        CHECK_EQ((GetWindowLongPtrW(lists[0], GWL_STYLE) & WS_VISIBLE) != 0, false);
-        CHECK_EQ((GetWindowLongPtrW(lists[1], GWL_STYLE) & WS_VISIBLE) != 0, true);
+        SendMessageW(tcp, BM_SETCHECK, BST_UNCHECKED, 0);
+        SendMessageW(created.window, WM_COMMAND,
+                     MAKEWPARAM(GetDlgCtrlID(tcp), BN_CLICKED),
+                     reinterpret_cast<LPARAM>(tcp));
+        CHECK_EQ(ListView_GetItemCount(list), 1);
+        wchar_t protocol[16]{};
+        ListView_GetItemText(list, 0, 2, protocol, static_cast<int>(std::size(protocol)));
+        CHECK_EQ(std::wstring_view(protocol), std::wstring_view(L"UDP"));
+        HWND ip_edit = GetDlgItem(created.window, 102);
+        SetWindowTextW(ip_edit, L"8.8.8.8");
+        CHECK_EQ(ListView_GetItemCount(list), 0);
+        SetWindowTextW(ip_edit, L"1.1.1.1");
+        CHECK_EQ(ListView_GetItemCount(list), 1);
+        SetWindowTextW(ip_edit, L"");
+
+        SendMessageW(udp, BM_SETCHECK, BST_UNCHECKED, 0);
+        SendMessageW(created.window, WM_COMMAND,
+                     MAKEWPARAM(GetDlgCtrlID(udp), BN_CLICKED),
+                     reinterpret_cast<LPARAM>(udp));
+        CHECK_EQ(SendMessageW(udp, BM_GETCHECK, 0, 0), BST_CHECKED);
+        CHECK_EQ(ListView_GetItemCount(list), 1);
+
+        SendMessageW(tcp, BM_SETCHECK, BST_CHECKED, 0);
+        SendMessageW(created.window, WM_COMMAND,
+                     MAKEWPARAM(GetDlgCtrlID(tcp), BN_CLICKED),
+                     reinterpret_cast<LPARAM>(tcp));
+        CHECK_EQ(ListView_GetItemCount(list), 2);
     }
     DestroyWindow(created.window);
 }
@@ -4147,7 +4193,7 @@ int main(int argc, char** argv) {
     TestConnectionCreationPreservesErrorAcrossDestruction();
     TestConnectionCreationDoesNotUseStaleSubclassFailureError();
     TestConnectionWindowCreatesFilterAndExportToolbar();
-    TestConnectionWindowSeparatesTcpAndUdpIntoTabs();
+    TestConnectionWindowFiltersTcpAndUdpWithCheckboxes();
     TestConnectionWindowStartsWideEnoughForDetailColumns();
     TestConnectionWindowFiltersBothEndpointsAndPreservesValidPort();
     TestConnectionWindowColumnClickMarksHeaderAndResetsTop();

@@ -60,7 +60,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
 
     INITCOMMONCONTROLSEX controls{};
     controls.dwSize = sizeof(controls);
-    controls.dwICC = ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_TAB_CLASSES;
+    controls.dwICC = ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES;
     if (!InitCommonControlsEx(&controls)) {
         MessageBoxW(nullptr, L"无法初始化 Windows 公共控件。", L"NetAssess",
                     MB_OK | MB_ICONERROR);
