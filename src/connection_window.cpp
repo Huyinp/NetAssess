@@ -26,6 +26,8 @@ constexpr int kIpFilterId = 102;
 constexpr int kExportId = 103;
 constexpr int kTcpFilterId = 104;
 constexpr int kUdpFilterId = 105;
+constexpr int kActiveFilterId = 106;
+constexpr int kHistoricalFilterId = 107;
 constexpr std::array<std::wstring_view, 12> kColumnNames{
     L"状态", L"方向", L"传输层协议", L"推断应用协议",
     L"本地地址", L"本地端口", L"远端地址", L"远端端口",
@@ -153,7 +155,13 @@ private:
             } else if ((reinterpret_cast<HWND>(lparam) == tcp_checkbox_ ||
                         reinterpret_cast<HWND>(lparam) == udp_checkbox_) &&
                        HIWORD(wparam) == BN_CLICKED) {
-                ApplyProtocolFilter(reinterpret_cast<HWND>(lparam));
+                ApplyRequiredCheckboxFilter(reinterpret_cast<HWND>(lparam),
+                                            tcp_checkbox_, udp_checkbox_);
+            } else if ((reinterpret_cast<HWND>(lparam) == active_checkbox_ ||
+                        reinterpret_cast<HWND>(lparam) == historical_checkbox_) &&
+                       HIWORD(wparam) == BN_CLICKED) {
+                ApplyRequiredCheckboxFilter(reinterpret_cast<HWND>(lparam),
+                                            active_checkbox_, historical_checkbox_);
             }
             return 0;
         case WM_SIZE:
@@ -220,6 +228,16 @@ private:
         if (udp_checkbox_ == nullptr) { return false; }
         SendMessageW(tcp_checkbox_, BM_SETCHECK, BST_CHECKED, 0);
         SendMessageW(udp_checkbox_, BM_SETCHECK, BST_CHECKED, 0);
+        status_label_ = create_control(L"STATIC", L"状态", SS_LEFT | SS_CENTERIMAGE, 0);
+        if (status_label_ == nullptr) { return false; }
+        active_checkbox_ = create_control(L"BUTTON", L"活跃",
+            WS_TABSTOP | BS_AUTOCHECKBOX, kActiveFilterId);
+        if (active_checkbox_ == nullptr) { return false; }
+        historical_checkbox_ = create_control(L"BUTTON", L"历史",
+            WS_TABSTOP | BS_AUTOCHECKBOX, kHistoricalFilterId);
+        if (historical_checkbox_ == nullptr) { return false; }
+        SendMessageW(active_checkbox_, BM_SETCHECK, BST_CHECKED, 0);
+        SendMessageW(historical_checkbox_, BM_SETCHECK, BST_CHECKED, 0);
         SendMessageW(ip_edit_, EM_SETCUEBANNER, TRUE,
                      reinterpret_cast<LPARAM>(L"本机或对端 IP"));
         SendMessageW(port_edit_, EM_SETCUEBANNER, TRUE,
@@ -253,7 +271,8 @@ private:
             return false;
         }
         for (HWND control : {ip_label_, port_label_, port_edit_, ip_edit_, protocol_label_,
-                             tcp_checkbox_, udp_checkbox_, export_button_}) {
+                             tcp_checkbox_, udp_checkbox_, status_label_, active_checkbox_,
+                             historical_checkbox_, export_button_}) {
             SendMessageW(control, WM_SETFONT,
                          reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
         }
@@ -289,13 +308,16 @@ private:
             x += scaled_width + gap;
         };
         place(ip_label_, 48);
-        place(ip_edit_, 220);
+        place(ip_edit_, 180);
         place(port_label_, 36);
-        place(port_edit_, 130);
-        place(protocol_label_, 36);
-        place(tcp_checkbox_, 55);
-        place(udp_checkbox_, 55);
-        place(export_button_, 100);
+        place(port_edit_, 100);
+        place(protocol_label_, 32);
+        place(tcp_checkbox_, 45);
+        place(udp_checkbox_, 45);
+        place(status_label_, 32);
+        place(active_checkbox_, 55);
+        place(historical_checkbox_, 55);
+        place(export_button_, 90);
         const int list_top = margin + control_height + margin;
         MoveWindow(pane_.list, margin, list_top,
                    std::max(0, static_cast<int>(client.right) - margin * 2),
@@ -359,10 +381,10 @@ private:
         RebuildFilteredRows();
     }
 
-    void ApplyProtocolFilter(HWND changed_checkbox) {
-        const bool tcp_checked = SendMessageW(tcp_checkbox_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        const bool udp_checked = SendMessageW(udp_checkbox_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        if (!tcp_checked && !udp_checked) {
+    void ApplyRequiredCheckboxFilter(HWND changed_checkbox, HWND first, HWND second) {
+        const bool first_checked = SendMessageW(first, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        const bool second_checked = SendMessageW(second, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        if (!first_checked && !second_checked) {
             SendMessageW(changed_checkbox, BM_SETCHECK, BST_CHECKED, 0);
         }
         pane_.scroll_state.ResetToAutoTop();
@@ -373,9 +395,15 @@ private:
         pane_.rows = FilterConnectionRows(raw_rows_, filter_);
         const bool show_tcp = SendMessageW(tcp_checkbox_, BM_GETCHECK, 0, 0) == BST_CHECKED;
         const bool show_udp = SendMessageW(udp_checkbox_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        const bool show_active =
+            SendMessageW(active_checkbox_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        const bool show_historical =
+            SendMessageW(historical_checkbox_, BM_GETCHECK, 0, 0) == BST_CHECKED;
         std::erase_if(pane_.rows, [&](const ConnectionDisplayRow& row) {
             return (row.connection.key.transport == TransportProtocol::Tcp && !show_tcp) ||
-                   (row.connection.key.transport == TransportProtocol::Udp && !show_udp);
+                   (row.connection.key.transport == TransportProtocol::Udp && !show_udp) ||
+                   (row.status == ConnectionActivityStatus::Active && !show_active) ||
+                   (row.status == ConnectionActivityStatus::Historical && !show_historical);
         });
         SortConnectionRows(pane_.rows, pane_.sort_column, pane_.ascending);
         ReconcileRows(pane_);
@@ -574,6 +602,9 @@ private:
     HWND protocol_label_{};
     HWND tcp_checkbox_{};
     HWND udp_checkbox_{};
+    HWND status_label_{};
+    HWND active_checkbox_{};
+    HWND historical_checkbox_{};
     HWND export_button_{};
     ConnectionErrorPresenter error_presenter_{};
     ConnectionFilter filter_;

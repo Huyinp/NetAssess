@@ -2854,6 +2854,7 @@ void TestConnectionWindowCreatesFilterAndExportToolbar() {
     bool has_export_button = false;
     bool has_ip_label = false;
     bool has_protocol_label = false;
+    bool has_status_label = false;
     HWND list = nullptr;
     for (HWND child = GetWindow(created.window, GW_CHILD); child != nullptr;
          child = GetWindow(child, GW_HWNDNEXT)) {
@@ -2868,18 +2869,23 @@ void TestConnectionWindowCreatesFilterAndExportToolbar() {
             std::wstring_view(title) == L"IP 地址") { has_ip_label = true; }
         if (std::wstring_view(class_name) == L"Static" &&
             std::wstring_view(title) == L"协议") { has_protocol_label = true; }
+        if (std::wstring_view(class_name) == L"Static" &&
+            std::wstring_view(title) == L"状态") { has_status_label = true; }
         if (std::wstring_view(class_name) == WC_LISTVIEWW) { list = child; }
     }
     CHECK_EQ(edit_count, 2);
     CHECK_EQ(has_export_button, true);
     CHECK_EQ(has_ip_label, true);
     CHECK_EQ(has_protocol_label, true);
+    CHECK_EQ(has_status_label, true);
     CHECK_EQ(list != nullptr, true);
     CHECK_EQ((GetWindowLongPtrW(GetDlgItem(created.window, 102), GWL_EXSTYLE) &
               WS_EX_CLIENTEDGE) != 0, true);
     CHECK_EQ((GetWindowLongPtrW(GetDlgItem(created.window, 101), GWL_EXSTYLE) &
               WS_EX_CLIENTEDGE) != 0, true);
-    SetWindowPos(created.window, nullptr, 0, 0, 900, 240,
+    SetWindowPos(created.window, nullptr, 0, 0,
+                 win32_dpi::Scale(820, win32_dpi::System()),
+                 win32_dpi::Scale(400, win32_dpi::System()),
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     RECT client{};
     GetClientRect(created.window, &client);
@@ -2976,6 +2982,81 @@ void TestConnectionWindowFiltersTcpAndUdpWithCheckboxes() {
                      MAKEWPARAM(GetDlgCtrlID(tcp), BN_CLICKED),
                      reinterpret_cast<LPARAM>(tcp));
         CHECK_EQ(ListView_GetItemCount(list), 2);
+    }
+    DestroyWindow(created.window);
+}
+
+void TestConnectionWindowFiltersActiveAndHistoricalWithCheckboxes() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    ConnectionAggregator connections;
+    FakeProcessInfoApi process_api;
+    const ProcessInstanceId process{42, 100};
+    process_api.creation_time = process.creation_time_100ns;
+    ProcessInfoCache cache(process_api);
+    const auto now = std::chrono::steady_clock::now();
+    connections.Add({MakeConnectionKey(process, TransportProtocol::Tcp,
+        ApplicationProtocol::HttpsTls, 50000, 443), L"test.exe",
+        TrafficDirection::Send, 128, now});
+    connections.Add({MakeConnectionKey(process, TransportProtocol::Tcp,
+        ApplicationProtocol::Http, 50001, 80), L"test.exe",
+        TrafficDirection::Send, 64, now - std::chrono::seconds(10)});
+    const auto created = CreateConnectionWindow(GetModuleHandleW(nullptr), nullptr,
+        process, L"test.exe", connections, cache);
+    CHECK_EQ(created.window != nullptr, true);
+    if (created.window == nullptr) { return; }
+
+    SendMessageW(created.window, kConnectionWindowRefreshMessage, 0, 0);
+    HWND list = FindWindowExW(created.window, nullptr, WC_LISTVIEWW, nullptr);
+    HWND active = nullptr;
+    HWND historical = nullptr;
+    for (HWND child = FindWindowExW(created.window, nullptr, L"Button", nullptr);
+         child != nullptr;
+         child = FindWindowExW(created.window, child, L"Button", nullptr)) {
+        wchar_t text[32]{};
+        GetWindowTextW(child, text, static_cast<int>(std::size(text)));
+        if (std::wstring_view(text) == L"活跃") { active = child; }
+        if (std::wstring_view(text) == L"历史") { historical = child; }
+    }
+    CHECK_EQ(list != nullptr, true);
+    CHECK_EQ(active != nullptr, true);
+    CHECK_EQ(historical != nullptr, true);
+    if (list != nullptr && active != nullptr && historical != nullptr) {
+        CHECK_EQ(SendMessageW(active, BM_GETCHECK, 0, 0), BST_CHECKED);
+        CHECK_EQ(SendMessageW(historical, BM_GETCHECK, 0, 0), BST_CHECKED);
+        CHECK_EQ(ListView_GetItemCount(list), 2);
+
+        SendMessageW(active, BM_SETCHECK, BST_UNCHECKED, 0);
+        SendMessageW(created.window, WM_COMMAND,
+                     MAKEWPARAM(GetDlgCtrlID(active), BN_CLICKED),
+                     reinterpret_cast<LPARAM>(active));
+        CHECK_EQ(ListView_GetItemCount(list), 1);
+        wchar_t status[16]{};
+        ListView_GetItemText(list, 0, 0, status, static_cast<int>(std::size(status)));
+        CHECK_EQ(std::wstring_view(status), std::wstring_view(L"历史"));
+
+        SendMessageW(historical, BM_SETCHECK, BST_UNCHECKED, 0);
+        SendMessageW(created.window, WM_COMMAND,
+                     MAKEWPARAM(GetDlgCtrlID(historical), BN_CLICKED),
+                     reinterpret_cast<LPARAM>(historical));
+        CHECK_EQ(SendMessageW(historical, BM_GETCHECK, 0, 0), BST_CHECKED);
+        CHECK_EQ(ListView_GetItemCount(list), 1);
+
+        SendMessageW(active, BM_SETCHECK, BST_CHECKED, 0);
+        SendMessageW(created.window, WM_COMMAND,
+                     MAKEWPARAM(GetDlgCtrlID(active), BN_CLICKED),
+                     reinterpret_cast<LPARAM>(active));
+        CHECK_EQ(ListView_GetItemCount(list), 2);
+
+        process_api.creation_time = std::nullopt;
+        SendMessageW(created.window, kConnectionWindowRefreshMessage, 0, 0);
+        SendMessageW(historical, BM_SETCHECK, BST_UNCHECKED, 0);
+        SendMessageW(created.window, WM_COMMAND,
+                     MAKEWPARAM(GetDlgCtrlID(historical), BN_CLICKED),
+                     reinterpret_cast<LPARAM>(historical));
+        CHECK_EQ(ListView_GetItemCount(list), 2);
+        ListView_GetItemText(list, 0, 0, status, static_cast<int>(std::size(status)));
+        CHECK_EQ(std::wstring_view(status), std::wstring_view(L"进程已结束"));
     }
     DestroyWindow(created.window);
 }
@@ -4194,6 +4275,7 @@ int main(int argc, char** argv) {
     TestConnectionCreationDoesNotUseStaleSubclassFailureError();
     TestConnectionWindowCreatesFilterAndExportToolbar();
     TestConnectionWindowFiltersTcpAndUdpWithCheckboxes();
+    TestConnectionWindowFiltersActiveAndHistoricalWithCheckboxes();
     TestConnectionWindowStartsWideEnoughForDetailColumns();
     TestConnectionWindowFiltersBothEndpointsAndPreservesValidPort();
     TestConnectionWindowColumnClickMarksHeaderAndResetsTop();
