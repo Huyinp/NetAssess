@@ -95,8 +95,14 @@ bool MatchesConnectionFilter(const ConnectionDisplayRow& row, const ConnectionFi
     const bool ip_matches =
         ContainsInvariantCaseInsensitive(FormatIpAddress(key.local.address), filter.ip) ||
         ContainsInvariantCaseInsensitive(FormatIpAddress(key.remote.address), filter.ip);
-    const bool port_matches = !filter.port.has_value() || key.local.port == *filter.port ||
-                              key.remote.port == *filter.port;
+    const std::size_t first = filter.port.find_first_not_of(L" \t\r\n");
+    const std::wstring_view port = first == std::wstring::npos
+        ? std::wstring_view{}
+        : std::wstring_view(filter.port).substr(
+              first, filter.port.find_last_not_of(L" \t\r\n") - first + 1);
+    const bool port_matches = port.empty() ||
+        std::to_wstring(key.local.port).find(port) != std::wstring::npos ||
+        std::to_wstring(key.remote.port).find(port) != std::wstring::npos;
     return ip_matches && port_matches;
 }
 

@@ -30,7 +30,7 @@ struct ConnectionDisplayRow {
 
 struct ConnectionFilter {
     std::wstring ip;
-    std::optional<std::uint16_t> port;
+    std::wstring port;
 };
 
 struct PortFilterParseResult {

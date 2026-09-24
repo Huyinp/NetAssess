@@ -109,6 +109,17 @@ public:
     };
 
 private:
+    struct ListPane {
+        TransportProtocol transport{};
+        HWND list{};
+        ListScrollState scroll_state;
+        ConnectionSortColumn sort_column{ConnectionSortColumn::CombinedSpeed};
+        bool ascending{};
+        std::vector<ConnectionDisplayRow> rows;
+        std::vector<ConnectionKey> current_keys;
+        std::map<ConnectionKey, int> row_map;
+    };
+
     LRESULT HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         switch (message) {
         case WM_CREATE: {
@@ -127,7 +138,14 @@ private:
             RefreshSnapshot();
             return 0;
         case WM_NOTIFY:
-            HandleNotify(reinterpret_cast<NMHDR*>(lparam));
+            if (const auto* notification = reinterpret_cast<NMHDR*>(lparam);
+                notification != nullptr && notification->hwndFrom == tab_control_ &&
+                notification->code == TCN_SELCHANGE) {
+                const int selected = TabCtrl_GetCurSel(tab_control_);
+                if (selected >= 0) { SwitchPane(static_cast<std::size_t>(selected)); }
+            } else {
+                HandleNotify(notification);
+            }
             return 0;
         case WM_COMMAND:
             if (reinterpret_cast<HWND>(lparam) == ip_edit_ && HIWORD(wparam) == EN_CHANGE) {
@@ -169,32 +187,6 @@ private:
     }
 
     bool CreateControls() {
-        list_view_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
-            0, 0, 0, 0, window_, nullptr,
-            reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(window_, GWLP_HINSTANCE)), nullptr);
-        if (list_view_ == nullptr) {
-            return false;
-        }
-
-        SendMessageW(list_view_, WM_SETFONT,
-                     reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
-        ListView_SetExtendedListViewStyleEx(
-            list_view_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER,
-            LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-
-        for (int index = 0; index < static_cast<int>(kColumnNames.size()); ++index) {
-            LVCOLUMNW column{};
-            column.mask = LVCF_TEXT | LVCF_SUBITEM;
-            column.pszText = const_cast<wchar_t*>(
-                kColumnNames[static_cast<std::size_t>(index)].data());
-            column.iSubItem = index;
-            SetLastError(ERROR_SUCCESS);
-            if (ListView_InsertColumn(list_view_, index, &column) == -1) {
-                return false;
-            }
-        }
         const HINSTANCE instance = reinterpret_cast<HINSTANCE>(
             GetWindowLongPtrW(window_, GWLP_HINSTANCE));
         auto create_control = [&](const wchar_t* class_name, const wchar_t* text,
@@ -216,16 +208,55 @@ private:
         export_button_ = create_control(L"BUTTON", L"导出 CSV", WS_TABSTOP | BS_PUSHBUTTON,
                                         kExportId);
         if (export_button_ == nullptr) { return false; }
+        tab_control_ = create_control(WC_TABCONTROLW, L"", WS_TABSTOP, 0);
+        if (tab_control_ == nullptr) { return false; }
+        panes_[0].transport = TransportProtocol::Tcp;
+        panes_[1].transport = TransportProtocol::Udp;
+        constexpr std::array<std::wstring_view, 2> tab_names{L"TCP 列表", L"UDP 列表"};
+        for (int index = 0; index < static_cast<int>(tab_names.size()); ++index) {
+            TCITEMW item{};
+            item.mask = TCIF_TEXT;
+            item.pszText = const_cast<wchar_t*>(tab_names[static_cast<std::size_t>(index)].data());
+            if (TabCtrl_InsertItem(tab_control_, index, &item) == -1) { return false; }
+        }
+        for (std::size_t pane_index = 0; pane_index < panes_.size(); ++pane_index) {
+            ListPane& pane = panes_[pane_index];
+            pane.list = CreateWindowExW(
+                WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS,
+                0, 0, 0, 0, window_, nullptr, instance, nullptr);
+            if (pane.list == nullptr) { return false; }
+            SendMessageW(pane.list, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+            ListView_SetExtendedListViewStyleEx(
+                pane.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER,
+                LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+            for (int column_index = 0;
+                 column_index < static_cast<int>(kColumnNames.size()); ++column_index) {
+                LVCOLUMNW column{};
+                column.mask = LVCF_TEXT | LVCF_SUBITEM;
+                column.pszText = const_cast<wchar_t*>(
+                    kColumnNames[static_cast<std::size_t>(column_index)].data());
+                column.iSubItem = column_index;
+                if (ListView_InsertColumn(pane.list, column_index, &column) == -1) {
+                    return false;
+                }
+            }
+            SetLastError(ERROR_SUCCESS);
+            if (!SetWindowSubclass(pane.list, ListProcedure,
+                                   static_cast<UINT_PTR>(pane_index + 1),
+                                   reinterpret_cast<DWORD_PTR>(this))) {
+                creation_error_ = CreationError();
+                return false;
+            }
+        }
         for (HWND control : {ip_label_, port_label_, port_edit_, ip_edit_, export_button_}) {
             SendMessageW(control, WM_SETFONT,
                          reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
         }
-        SetLastError(ERROR_SUCCESS);
-        if (!SetWindowSubclass(list_view_, ListProcedure, 1,
-                               reinterpret_cast<DWORD_PTR>(this))) {
-            creation_error_ = CreationError();
-            return false;
-        }
+        SendMessageW(tab_control_, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+        SwitchPane(0);
         UpdateColumnWidths();
         LayoutControls();
         return true;
@@ -235,15 +266,17 @@ private:
         constexpr std::array<int, 12> column_widths{
             88, 70, 92, 170, 190, 82, 190, 82, 105, 105, 105, 105,
         };
-        for (int index = 0; index < static_cast<int>(column_widths.size()); ++index) {
-            ListView_SetColumnWidth(
-                list_view_, index,
-                win32_dpi::Scale(column_widths[static_cast<std::size_t>(index)], dpi_));
+        for (const ListPane& pane : panes_) {
+            for (int index = 0; index < static_cast<int>(column_widths.size()); ++index) {
+                ListView_SetColumnWidth(
+                    pane.list, index,
+                    win32_dpi::Scale(column_widths[static_cast<std::size_t>(index)], dpi_));
+            }
         }
     }
 
     void LayoutControls() const {
-        if (list_view_ == nullptr || export_button_ == nullptr) {
+        if (tab_control_ == nullptr || export_button_ == nullptr) {
             return;
         }
         RECT client{};
@@ -263,9 +296,28 @@ private:
         place(port_edit_, 90);
         place(export_button_, 100);
         const int list_top = margin + control_height + margin;
-        MoveWindow(list_view_, margin, list_top,
+        MoveWindow(tab_control_, margin, list_top,
                    std::max(0, static_cast<int>(client.right) - margin * 2),
                    std::max(0, static_cast<int>(client.bottom) - list_top - margin), TRUE);
+        RECT page{};
+        GetClientRect(tab_control_, &page);
+        TabCtrl_AdjustRect(tab_control_, FALSE, &page);
+        MapWindowPoints(tab_control_, window_, reinterpret_cast<POINT*>(&page), 2);
+        for (const ListPane& pane : panes_) {
+            MoveWindow(pane.list, page.left, page.top,
+                       std::max(0, static_cast<int>(page.right - page.left)),
+                       std::max(0, static_cast<int>(page.bottom - page.top)), TRUE);
+        }
+    }
+
+    void SwitchPane(std::size_t index) {
+        if (index >= panes_.size()) { return; }
+        active_pane_ = index;
+        TabCtrl_SetCurSel(tab_control_, static_cast<int>(index));
+        for (std::size_t pane_index = 0; pane_index < panes_.size(); ++pane_index) {
+            ShowWindow(panes_[pane_index].list,
+                       pane_index == active_pane_ ? SW_SHOW : SW_HIDE);
+        }
     }
 
     static LRESULT CALLBACK ListProcedure(HWND list, UINT message, WPARAM wparam,
@@ -282,9 +334,18 @@ private:
               wparam == VK_NEXT || wparam == VK_HOME || wparam == VK_END));
         const LRESULT result = DefSubclassProc(list, message, wparam, lparam);
         if (user_scroll) {
-            self->scroll_state_.ObserveUserScroll(ListView_GetTopIndex(list) == 0);
+            if (ListPane* pane = self->PaneForList(list)) {
+                pane->scroll_state.ObserveUserScroll(ListView_GetTopIndex(list) == 0);
+            }
         }
         return result;
+    }
+
+    ListPane* PaneForList(HWND list) {
+        for (ListPane& pane : panes_) {
+            if (pane.list == list) { return &pane; }
+        }
+        return nullptr;
     }
 
     static std::wstring EditText(HWND edit) {
@@ -296,7 +357,12 @@ private:
 
     void ApplyFilterChange(bool port_changed) {
         if (port_changed) {
-            const PortFilterParseResult parsed = ParsePortFilter(EditText(port_edit_));
+            std::wstring port = EditText(port_edit_);
+            const std::size_t first = port.find_first_not_of(L" \t\r\n");
+            port = first == std::wstring::npos
+                ? std::wstring{}
+                : port.substr(first, port.find_last_not_of(L" \t\r\n") - first + 1);
+            const PortFilterParseResult parsed = ParsePortFilter(port);
             if (!parsed.valid) {
                 if (!invalid_port_reported_) {
                     invalid_port_reported_ = true;
@@ -306,18 +372,29 @@ private:
                 return;
             }
             invalid_port_reported_ = false;
-            filter_.port = parsed.port;
+            filter_.port = std::move(port);
         } else {
             filter_.ip = EditText(ip_edit_);
         }
-        scroll_state_.ResetToAutoTop();
+        for (ListPane& pane : panes_) { pane.scroll_state.ResetToAutoTop(); }
         RebuildFilteredRows();
     }
 
     void RebuildFilteredRows() {
-        rows_ = FilterConnectionRows(raw_rows_, filter_);
-        SortConnectionRows(rows_, sort_column_, ascending_);
-        ReconcileRows();
+        const auto filtered = FilterConnectionRows(raw_rows_, filter_);
+        for (ListPane& pane : panes_) { pane.rows.clear(); }
+        for (const ConnectionDisplayRow& row : filtered) {
+            for (ListPane& pane : panes_) {
+                if (row.connection.key.transport == pane.transport) {
+                    pane.rows.push_back(row);
+                    break;
+                }
+            }
+        }
+        for (ListPane& pane : panes_) {
+            SortConnectionRows(pane.rows, pane.sort_column, pane.ascending);
+            ReconcileRows(pane);
+        }
     }
 
     void ExportRows() {
@@ -326,8 +403,9 @@ private:
             headers[index] = kColumnNames[index];
         }
         std::vector<std::vector<std::wstring>> data;
-        data.reserve(rows_.size());
-        for (const ConnectionDisplayRow& row : rows_) {
+        const ListPane& pane = panes_[active_pane_];
+        data.reserve(pane.rows.size());
+        for (const ConnectionDisplayRow& row : pane.rows) {
             data.push_back(ConnectionCsvCells(row));
         }
         const CsvSaveResult result = SaveCsvWithDialog(window_, L"连接明细.csv", headers, data);
@@ -337,23 +415,24 @@ private:
     }
 
     void HandleNotify(const NMHDR* notification) {
-        if (notification == nullptr || notification->hwndFrom != list_view_ ||
-            notification->code != LVN_COLUMNCLICK) {
+        if (notification == nullptr || notification->code != LVN_COLUMNCLICK) {
             return;
         }
+        ListPane* pane = PaneForList(notification->hwndFrom);
+        if (pane == nullptr) { return; }
         const auto* column_click = reinterpret_cast<const NMLISTVIEW*>(notification);
         const ConnectionSortColumn clicked_column =
             SortColumnForListColumn(column_click->iSubItem);
-        if (sort_column_ == clicked_column) {
-            ascending_ = !ascending_;
+        if (pane->sort_column == clicked_column) {
+            pane->ascending = !pane->ascending;
         } else {
-            sort_column_ = clicked_column;
-            ascending_ = true;
+            pane->sort_column = clicked_column;
+            pane->ascending = true;
         }
-        scroll_state_.ResetToAutoTop();
-        UpdateListViewSortIndicator(list_view_, column_click->iSubItem, ascending_);
-        SortConnectionRows(rows_, sort_column_, ascending_);
-        ReconcileRows();
+        pane->scroll_state.ResetToAutoTop();
+        UpdateListViewSortIndicator(pane->list, column_click->iSubItem, pane->ascending);
+        SortConnectionRows(pane->rows, pane->sort_column, pane->ascending);
+        ReconcileRows(*pane);
     }
 
     void RefreshSnapshot() {
@@ -363,23 +442,23 @@ private:
         RebuildFilteredRows();
     }
 
-    void ReconcileRows() {
-        auto guard = scroll_state_.GuardProgrammaticScroll();
-        const std::set<ConnectionKey> selected_keys = SelectedKeys();
-        const ScrollAnchor scroll_anchor = CaptureScrollAnchor();
-        ReconcileRowStructure();
-        for (int index = 0; index < static_cast<int>(rows_.size()); ++index) {
-            UpdateRow(index, rows_[static_cast<std::size_t>(index)]);
+    void ReconcileRows(ListPane& pane) {
+        auto guard = pane.scroll_state.GuardProgrammaticScroll();
+        const std::set<ConnectionKey> selected_keys = SelectedKeys(pane);
+        const ScrollAnchor scroll_anchor = CaptureScrollAnchor(pane);
+        ReconcileRowStructure(pane);
+        for (int index = 0; index < static_cast<int>(pane.rows.size()); ++index) {
+            UpdateRow(pane, index, pane.rows[static_cast<std::size_t>(index)]);
         }
-        RestoreSelection(selected_keys);
-        RestoreScrollAnchor(scroll_anchor);
+        RestoreSelection(pane, selected_keys);
+        RestoreScrollAnchor(pane, scroll_anchor);
     }
 
-    std::set<ConnectionKey> SelectedKeys() const {
+    std::set<ConnectionKey> SelectedKeys(const ListPane& pane) const {
         std::set<ConnectionKey> selected;
-        for (int index = 0; index < static_cast<int>(current_keys_.size()); ++index) {
-            if ((ListView_GetItemState(list_view_, index, LVIS_SELECTED) & LVIS_SELECTED) != 0) {
-                selected.insert(current_keys_[static_cast<std::size_t>(index)]);
+        for (int index = 0; index < static_cast<int>(pane.current_keys.size()); ++index) {
+            if ((ListView_GetItemState(pane.list, index, LVIS_SELECTED) & LVIS_SELECTED) != 0) {
+                selected.insert(pane.current_keys[static_cast<std::size_t>(index)]);
             }
         }
         return selected;
@@ -390,110 +469,111 @@ private:
         int previous_top{};
     };
 
-    ScrollAnchor CaptureScrollAnchor() const {
-        const int top = ListView_GetTopIndex(list_view_);
-        if (top >= 0 && top < static_cast<int>(current_keys_.size())) {
-            return {current_keys_[static_cast<std::size_t>(top)], top};
+    ScrollAnchor CaptureScrollAnchor(const ListPane& pane) const {
+        const int top = ListView_GetTopIndex(pane.list);
+        if (top >= 0 && top < static_cast<int>(pane.current_keys.size())) {
+            return {pane.current_keys[static_cast<std::size_t>(top)], top};
         }
         return {std::nullopt, top};
     }
 
-    void ReconcileRowStructure() {
+    void ReconcileRowStructure(ListPane& pane) {
         std::set<ConnectionKey> desired_keys;
-        for (const ConnectionDisplayRow& row : rows_) {
+        for (const ConnectionDisplayRow& row : pane.rows) {
             desired_keys.insert(row.connection.key);
         }
 
-        for (int index = static_cast<int>(current_keys_.size()) - 1; index >= 0; --index) {
-            if (!desired_keys.contains(current_keys_[static_cast<std::size_t>(index)])) {
-                if (ListView_DeleteItem(list_view_, index)) {
-                    current_keys_.erase(current_keys_.begin() + index);
+        for (int index = static_cast<int>(pane.current_keys.size()) - 1; index >= 0; --index) {
+            if (!desired_keys.contains(pane.current_keys[static_cast<std::size_t>(index)])) {
+                if (ListView_DeleteItem(pane.list, index)) {
+                    pane.current_keys.erase(pane.current_keys.begin() + index);
                 }
             }
         }
-        RebuildRowMap();
+        RebuildRowMap(pane);
 
-        for (int target = 0; target < static_cast<int>(rows_.size()); ++target) {
-            const ConnectionKey& key = rows_[static_cast<std::size_t>(target)].connection.key;
-            const auto existing = row_map_.find(key);
-            if (existing == row_map_.end()) {
-                if (InsertBlankRow(target)) {
-                    current_keys_.insert(current_keys_.begin() + target, key);
-                    RebuildRowMap();
+        for (int target = 0; target < static_cast<int>(pane.rows.size()); ++target) {
+            const ConnectionKey& key = pane.rows[static_cast<std::size_t>(target)].connection.key;
+            const auto existing = pane.row_map.find(key);
+            if (existing == pane.row_map.end()) {
+                if (InsertBlankRow(pane, target)) {
+                    pane.current_keys.insert(pane.current_keys.begin() + target, key);
+                    RebuildRowMap(pane);
                 }
             } else if (existing->second != target) {
                 const int source = existing->second;
-                if (ListView_DeleteItem(list_view_, source)) {
-                    current_keys_.erase(current_keys_.begin() + source);
-                    if (InsertBlankRow(target)) {
-                        current_keys_.insert(current_keys_.begin() + target, key);
+                if (ListView_DeleteItem(pane.list, source)) {
+                    pane.current_keys.erase(pane.current_keys.begin() + source);
+                    if (InsertBlankRow(pane, target)) {
+                        pane.current_keys.insert(pane.current_keys.begin() + target, key);
                     }
-                    RebuildRowMap();
+                    RebuildRowMap(pane);
                 }
             }
         }
     }
 
-    bool InsertBlankRow(int index) const {
+    bool InsertBlankRow(const ListPane& pane, int index) const {
         wchar_t blank[] = L"";
         LVITEMW item{};
         item.mask = LVIF_TEXT;
         item.iItem = index;
         item.pszText = blank;
-        return ListView_InsertItem(list_view_, &item) != -1;
+        return ListView_InsertItem(pane.list, &item) != -1;
     }
 
-    void RebuildRowMap() {
-        row_map_.clear();
-        for (int index = 0; index < static_cast<int>(current_keys_.size()); ++index) {
-            row_map_.emplace(current_keys_[static_cast<std::size_t>(index)], index);
+    void RebuildRowMap(ListPane& pane) {
+        pane.row_map.clear();
+        for (int index = 0; index < static_cast<int>(pane.current_keys.size()); ++index) {
+            pane.row_map.emplace(pane.current_keys[static_cast<std::size_t>(index)], index);
         }
     }
 
-    void UpdateRow(int index, const ConnectionDisplayRow& row) const {
+    void UpdateRow(const ListPane& pane, int index, const ConnectionDisplayRow& row) const {
         const auto cells = ConnectionCsvCells(row);
         for (int column = 0; column < static_cast<int>(cells.size()); ++column) {
-            SetItemText(index, column, cells[static_cast<std::size_t>(column)]);
+            SetItemText(pane, index, column, cells[static_cast<std::size_t>(column)]);
         }
     }
 
-    void SetItemText(int row, int column, std::wstring_view text) const {
+    void SetItemText(const ListPane& pane, int row, int column, std::wstring_view text) const {
         std::wstring value{text};
         LVITEMW item{};
         item.iSubItem = column;
         item.pszText = value.data();
-        SendMessageW(list_view_, LVM_SETITEMTEXTW, row,
+        SendMessageW(pane.list, LVM_SETITEMTEXTW, row,
                      reinterpret_cast<LPARAM>(&item));
     }
 
-    void RestoreSelection(const std::set<ConnectionKey>& selected_keys) const {
-        ListView_SetItemState(list_view_, -1, 0, LVIS_SELECTED);
+    void RestoreSelection(const ListPane& pane,
+                          const std::set<ConnectionKey>& selected_keys) const {
+        ListView_SetItemState(pane.list, -1, 0, LVIS_SELECTED);
         for (const ConnectionKey& key : selected_keys) {
-            const auto row = row_map_.find(key);
-            if (row != row_map_.end()) {
-                ListView_SetItemState(list_view_, row->second, LVIS_SELECTED, LVIS_SELECTED);
+            const auto row = pane.row_map.find(key);
+            if (row != pane.row_map.end()) {
+                ListView_SetItemState(pane.list, row->second, LVIS_SELECTED, LVIS_SELECTED);
             }
         }
     }
 
-    void RestoreScrollAnchor(const ScrollAnchor& anchor) const {
-        const int count = ListView_GetItemCount(list_view_);
+    void RestoreScrollAnchor(const ListPane& pane, const ScrollAnchor& anchor) const {
+        const int count = ListView_GetItemCount(pane.list);
         if (count == 0) {
             return;
         }
-        int target = scroll_state_.auto_top() ? 0 :
+        int target = pane.scroll_state.auto_top() ? 0 :
             std::clamp(anchor.previous_top, 0, count - 1);
-        if (!scroll_state_.auto_top() && anchor.key) {
-            const auto row = row_map_.find(*anchor.key);
-            if (row != row_map_.end()) {
+        if (!pane.scroll_state.auto_top() && anchor.key) {
+            const auto row = pane.row_map.find(*anchor.key);
+            if (row != pane.row_map.end()) {
                 target = row->second;
             }
         }
-        ListView_EnsureVisible(list_view_, target, FALSE);
+        ListView_EnsureVisible(pane.list, target, FALSE);
         RECT item_rectangle{};
-        if (ListView_GetItemRect(list_view_, 0, &item_rectangle, LVIR_BOUNDS)) {
-            const int current_top = ListView_GetTopIndex(list_view_);
-            ListView_Scroll(list_view_, 0,
+        if (ListView_GetItemRect(pane.list, 0, &item_rectangle, LVIR_BOUNDS)) {
+            const int current_top = ListView_GetTopIndex(pane.list);
+            ListView_Scroll(pane.list, 0,
                             (target - current_top) *
                                 (item_rectangle.bottom - item_rectangle.top));
         }
@@ -504,7 +584,7 @@ private:
     ConnectionAggregator& aggregator_;
     ProcessInfoCache& process_cache_;
     HWND window_{};
-    HWND list_view_{};
+    HWND tab_control_{};
     HWND ip_label_{};
     HWND ip_edit_{};
     HWND port_label_{};
@@ -512,16 +592,12 @@ private:
     HWND export_button_{};
     ConnectionErrorPresenter error_presenter_{};
     ConnectionFilter filter_;
-    ListScrollState scroll_state_;
     bool invalid_port_reported_{};
     DWORD creation_error_{};
     UINT dpi_{win32_dpi::kDefaultDpi};
-    ConnectionSortColumn sort_column_{ConnectionSortColumn::CombinedSpeed};
-    bool ascending_{};
-    std::vector<ConnectionDisplayRow> rows_;
+    std::array<ListPane, 2> panes_{};
+    std::size_t active_pane_{};
     std::vector<ConnectionDisplayRow> raw_rows_;
-    std::vector<ConnectionKey> current_keys_;
-    std::map<ConnectionKey, int> row_map_;
 };
 
 bool RegisterWindowClass(HINSTANCE instance) {

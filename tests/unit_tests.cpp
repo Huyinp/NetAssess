@@ -1606,50 +1606,50 @@ void TestConnectionFilteringMatchesEndpointsAndPreservesCallerOrder() {
         CHECK_EQ(all[2].connection.key, third.connection.key);
     }
 
-    const auto local_ipv4 = FilterConnectionRows(rows, {L"192.0.2", std::nullopt});
+    const auto local_ipv4 = FilterConnectionRows(rows, {L"192.0.2", L""});
     CHECK_EQ(local_ipv4.size(), 1ULL);
     if (local_ipv4.size() == 1) {
         CHECK_EQ(local_ipv4[0].connection.key, first.connection.key);
     }
 
-    const auto remote_ipv4 = FilterConnectionRows(rows, {L"198.51.100", std::nullopt});
+    const auto remote_ipv4 = FilterConnectionRows(rows, {L"198.51.100", L""});
     CHECK_EQ(remote_ipv4.size(), 1ULL);
     if (remote_ipv4.size() == 1) {
         CHECK_EQ(remote_ipv4[0].connection.key, first.connection.key);
     }
 
-    const auto case_insensitive_ipv6 = FilterConnectionRows(rows, {L"DB8", std::nullopt});
+    const auto case_insensitive_ipv6 = FilterConnectionRows(rows, {L"DB8", L""});
     CHECK_EQ(case_insensitive_ipv6.size(), 1ULL);
     if (case_insensitive_ipv6.size() == 1) {
         CHECK_EQ(case_insensitive_ipv6[0].connection.key, second.connection.key);
     }
 
-    const auto both_ipv6 = FilterConnectionRows(rows, {L"2001", std::nullopt});
+    const auto both_ipv6 = FilterConnectionRows(rows, {L"2001", L""});
     CHECK_EQ(both_ipv6.size(), 2ULL);
     if (both_ipv6.size() == 2) {
         CHECK_EQ(both_ipv6[0].connection.key, second.connection.key);
         CHECK_EQ(both_ipv6[1].connection.key, third.connection.key);
     }
 
-    const auto local_port = FilterConnectionRows(rows, {L"", 22});
+    const auto local_port = FilterConnectionRows(rows, {L"", L"22"});
     CHECK_EQ(local_port.size(), 1ULL);
     if (local_port.size() == 1) {
         CHECK_EQ(local_port[0].connection.key, third.connection.key);
     }
 
-    const auto remote_port = FilterConnectionRows(rows, {L"", 443});
+    const auto remote_port = FilterConnectionRows(rows, {L"", L"443"});
     CHECK_EQ(remote_port.size(), 1ULL);
     if (remote_port.size() == 1) {
         CHECK_EQ(remote_port[0].connection.key, first.connection.key);
     }
 
-    const auto combined = FilterConnectionRows(rows, {L"db8", 5353});
+    const auto combined = FilterConnectionRows(rows, {L"db8", L"5353"});
     CHECK_EQ(combined.size(), 1ULL);
     if (combined.size() == 1) {
         CHECK_EQ(combined[0].connection.key, second.connection.key);
     }
 
-    const auto mismatched_combined = FilterConnectionRows(rows, {L"db8", 443});
+    const auto mismatched_combined = FilterConnectionRows(rows, {L"db8", L"443"});
     CHECK_EQ(mismatched_combined.size(), 0ULL);
 }
 
@@ -1679,6 +1679,18 @@ void TestPortFilterParsingUsesStrictDecimalPortRules() {
         CHECK_EQ(result.valid, false);
         CHECK_EQ(result.port.has_value(), false);
     }
+}
+
+void TestConnectionPortFilterMatchesDisplayedPortText() {
+    const auto now = std::chrono::steady_clock::now();
+    const ConnectionDisplayRow row{
+        {MakeConnectionKey({1, 1}, TransportProtocol::Tcp, ApplicationProtocol::Other,
+                           4990, 443),
+         L"server.exe", 1, 0, 0.0, 0.0, now},
+        true, ConnectionActivityStatus::Active, ConnectionDirection::SendOnly};
+
+    const auto filtered = FilterConnectionRows({row}, {L"", L" 990 "});
+    CHECK_EQ(filtered.size(), 1U);
 }
 
 void TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically() {
@@ -2795,10 +2807,12 @@ LRESULT CALLBACK DestroyDetailListBeforeSubclassHook(int code, WPARAM wparam, LP
     LRESULT next = CallNextHookEx(nullptr, code, wparam, lparam);
     if (code == HC_ACTION && !destroyed_list_before_subclass) {
         const auto* message = reinterpret_cast<const CWPRETSTRUCT*>(lparam);
-        if (message->message == WM_SETFONT && GetDlgCtrlID(message->hwnd) == 103) {
-            HWND list = FindWindowExW(GetParent(message->hwnd), nullptr, WC_LISTVIEWW, nullptr);
-            if (list != nullptr) {
-                destroyed_list_before_subclass = DestroyWindow(list) != FALSE;
+        wchar_t class_name[32]{};
+        GetClassNameW(message->hwnd, class_name, static_cast<int>(std::size(class_name)));
+        if (message->message == WM_SETFONT &&
+            std::wstring_view(class_name) == WC_LISTVIEWW) {
+            destroyed_list_before_subclass = DestroyWindow(message->hwnd) != FALSE;
+            if (destroyed_list_before_subclass) {
                 SetLastError(ERROR_ACCESS_DENIED);
             }
         }
@@ -2876,6 +2890,50 @@ void TestConnectionWindowCreatesFilterAndExportToolbar() {
     DestroyWindow(created.window);
 }
 
+void TestConnectionWindowSeparatesTcpAndUdpIntoTabs() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    const ProcessInstanceId process{42, 100};
+    const auto now = std::chrono::steady_clock::now();
+    connections.Add({MakeConnectionKey(process, TransportProtocol::Tcp,
+        ApplicationProtocol::HttpsTls, 50000, 443), L"test.exe",
+        TrafficDirection::Send, 128, now});
+    connections.Add({MakeConnectionKey(process, TransportProtocol::Udp,
+        ApplicationProtocol::Dns, 53000, 53), L"test.exe",
+        TrafficDirection::Receive, 64, now});
+    const auto created = CreateConnectionWindow(GetModuleHandleW(nullptr), nullptr,
+        process, L"test.exe", connections, cache);
+    CHECK_EQ(created.window != nullptr, true);
+    if (created.window == nullptr) { return; }
+
+    SendMessageW(created.window, kConnectionWindowRefreshMessage, 0, 0);
+    HWND tab = FindWindowExW(created.window, nullptr, WC_TABCONTROLW, nullptr);
+    std::vector<HWND> lists;
+    for (HWND child = FindWindowExW(created.window, nullptr, WC_LISTVIEWW, nullptr);
+         child != nullptr;
+         child = FindWindowExW(created.window, child, WC_LISTVIEWW, nullptr)) {
+        lists.push_back(child);
+    }
+    CHECK_EQ(tab != nullptr, true);
+    CHECK_EQ(lists.size(), 2U);
+    if (tab != nullptr && lists.size() == 2) {
+        CHECK_EQ(TabCtrl_GetItemCount(tab), 2);
+        CHECK_EQ(ListView_GetItemCount(lists[0]), 1);
+        CHECK_EQ(ListView_GetItemCount(lists[1]), 1);
+        CHECK_EQ((GetWindowLongPtrW(lists[0], GWL_STYLE) & WS_VISIBLE) != 0, true);
+        CHECK_EQ((GetWindowLongPtrW(lists[1], GWL_STYLE) & WS_VISIBLE) != 0, false);
+
+        TabCtrl_SetCurSel(tab, 1);
+        NMHDR changed{tab, 0, TCN_SELCHANGE};
+        SendMessageW(created.window, WM_NOTIFY, 0, reinterpret_cast<LPARAM>(&changed));
+        CHECK_EQ((GetWindowLongPtrW(lists[0], GWL_STYLE) & WS_VISIBLE) != 0, false);
+        CHECK_EQ((GetWindowLongPtrW(lists[1], GWL_STYLE) & WS_VISIBLE) != 0, true);
+    }
+    DestroyWindow(created.window);
+}
+
 void TestConnectionWindowStartsWideEnoughForDetailColumns() {
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
     CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
@@ -2932,7 +2990,9 @@ void TestConnectionWindowFiltersBothEndpointsAndPreservesValidPort() {
             if (GetDlgCtrlID(child) == 102) { edits[0] = child; }
             if (GetDlgCtrlID(child) == 101) { edits[1] = child; }
         }
-        if (std::wstring_view(class_name) == WC_LISTVIEWW) { list = child; }
+        if (std::wstring_view(class_name) == WC_LISTVIEWW && list == nullptr) {
+            list = child;
+        }
     }
     CHECK_EQ(edit_count, 2);
     CHECK_EQ(edits[0] != nullptr, true);
@@ -2945,6 +3005,10 @@ void TestConnectionWindowFiltersBothEndpointsAndPreservesValidPort() {
         CHECK_EQ(ListView_GetItemCount(list), 1);
         SetWindowTextW(edits[1], L"80");
         CHECK_EQ(ListView_GetItemCount(list), 1);
+        detail_error_count = 0;
+        SetWindowTextW(edits[1], L" 80 ");
+        CHECK_EQ(ListView_GetItemCount(list), 1);
+        CHECK_EQ(detail_error_count, 0);
         SetWindowTextW(edits[0], L"10.0.0.1");
         CHECK_EQ(ListView_GetItemCount(list), 0);
         SetWindowTextW(edits[1], L"50000");
@@ -4048,6 +4112,7 @@ int main(int argc, char** argv) {
     TestConnectionRowsSortEveryColumnWithBinaryAndKeyTieBreakers();
     TestConnectionFilteringMatchesEndpointsAndPreservesCallerOrder();
     TestPortFilterParsingUsesStrictDecimalPortRules();
+    TestConnectionPortFilterMatchesDisplayedPortText();
     TestTrafficFormatting();
     TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically();
     TestVisibleRowsFilterWithoutMutatingSnapshotAndAttachLiveness();
@@ -4082,6 +4147,7 @@ int main(int argc, char** argv) {
     TestConnectionCreationPreservesErrorAcrossDestruction();
     TestConnectionCreationDoesNotUseStaleSubclassFailureError();
     TestConnectionWindowCreatesFilterAndExportToolbar();
+    TestConnectionWindowSeparatesTcpAndUdpIntoTabs();
     TestConnectionWindowStartsWideEnoughForDetailColumns();
     TestConnectionWindowFiltersBothEndpointsAndPreservesValidPort();
     TestConnectionWindowColumnClickMarksHeaderAndResetsTop();
