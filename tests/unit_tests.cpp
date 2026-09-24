@@ -12,6 +12,7 @@
 #include "process_actions.h"
 #include "protocol_classifier.h"
 #include "traffic_aggregator.h"
+#include "win32_dpi.h"
 
 #include <algorithm>
 #include <array>
@@ -2831,6 +2832,22 @@ void TestConnectionWindowCreatesFilterAndExportToolbar() {
     DestroyWindow(created.window);
 }
 
+void TestConnectionWindowStartsWideEnoughForDetailColumns() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    const auto created = CreateConnectionWindow(GetModuleHandleW(nullptr), nullptr,
+        {42, 100}, L"test.exe", connections, cache);
+    CHECK_EQ(created.window != nullptr, true);
+    if (created.window == nullptr) { return; }
+
+    RECT client{};
+    CHECK_EQ(GetClientRect(created.window, &client), TRUE);
+    CHECK_EQ(client.right - client.left, win32_dpi::Scale(1450, win32_dpi::System()));
+    DestroyWindow(created.window);
+}
+
 int detail_error_count = 0;
 DWORD detail_error_code = ERROR_SUCCESS;
 std::wstring detail_error_operation;
@@ -4143,6 +4160,7 @@ int main(int argc, char** argv) {
     TestConnectionCreationPreservesErrorAcrossDestruction();
     TestConnectionCreationDoesNotUseStaleSubclassFailureError();
     TestConnectionWindowCreatesFilterAndExportToolbar();
+    TestConnectionWindowStartsWideEnoughForDetailColumns();
     TestConnectionWindowFiltersBothEndpointsAndPreservesValidPort();
     TestConnectionWindowColumnClickMarksHeaderAndResetsTop();
     TestConnectionCsvCellsMatchAllTwelveVisibleValues();

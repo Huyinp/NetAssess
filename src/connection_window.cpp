@@ -552,7 +552,7 @@ ConnectionWindowCreationResult CreateConnectionWindow(
     constexpr DWORD style = WS_OVERLAPPEDWINDOW;
     constexpr DWORD extended_style = 0;
     const UINT dpi = win32_dpi::System();
-    RECT window_rectangle{0, 0, win32_dpi::Scale(1180, dpi), win32_dpi::Scale(600, dpi)};
+    RECT window_rectangle{0, 0, win32_dpi::Scale(1450, dpi), win32_dpi::Scale(600, dpi)};
     win32_dpi::AdjustWindowRect(window_rectangle, style, extended_style, dpi);
 
     std::wstring title = process_name + L" — PID " + std::to_wstring(process.pid) +
