@@ -2,6 +2,7 @@
 
 #include "traffic_types.h"
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -25,18 +26,20 @@ public:
     ProcessInfoCache();
     explicit ProcessInfoCache(IProcessInfoApi& process_api);
 
-    ProcessInfo Resolve(std::uint32_t pid, std::uint64_t fallback_observation_id);
+    ProcessInfo Resolve(std::uint32_t pid, std::uint64_t fallback_observation_id,
+                        std::chrono::steady_clock::time_point now);
     bool RefreshAlive(ProcessInstanceId id) const;
 
 private:
     struct CachedProcess {
         ProcessInfo info;
         std::uint8_t failed_creation_queries{};
+        std::chrono::steady_clock::time_point last_validation;
     };
 
     struct FallbackEntry {
         ProcessInfo info;
-        std::uint8_t observations_before_retry{7};
+        std::chrono::steady_clock::time_point last_attempt;
     };
 
     IProcessInfoApi& process_api_;

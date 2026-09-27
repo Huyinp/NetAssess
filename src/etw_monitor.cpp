@@ -388,12 +388,13 @@ void EtwMonitor::HandleEvent(const EVENT_RECORD& record) {
         return;
     }
 
+    const auto observed_at = std::chrono::steady_clock::now();
     const auto process = process_cache_.Resolve(
-        decoded->pid, static_cast<std::uint64_t>(record.EventHeader.TimeStamp.QuadPart));
+        decoded->pid, static_cast<std::uint64_t>(record.EventHeader.TimeStamp.QuadPart),
+        observed_at);
     const auto application_protocol = InferApplicationProtocol(
         decoded->transport, decoded->direction, decoded->source_port,
         decoded->destination_port);
-    const auto observed_at = std::chrono::steady_clock::now();
     const TrafficEvent traffic_event{
         {process.id, decoded->transport, application_protocol}, process.name,
         decoded->direction, decoded->bytes};

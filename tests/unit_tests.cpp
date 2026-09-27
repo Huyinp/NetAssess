@@ -1361,7 +1361,8 @@ void TestSyntheticRecordFlowsThroughDecodeResolveClassifyAndAggregate() {
     const auto decoded = decoder.Decode(record);
     CHECK_EQ(decoded.has_value(), true);
     if (decoded) {
-        const auto process = process_cache.Resolve(decoded->pid, 1);
+        const auto process = process_cache.Resolve(
+            decoded->pid, 1, std::chrono::steady_clock::time_point{});
         const auto application = InferApplicationProtocol(
             decoded->transport, decoded->direction, decoded->source_port,
             decoded->destination_port);
@@ -1899,8 +1900,9 @@ void TestTakeConnectionWindowsMakesDestroyCallbacksSafe() {
 
 void TestProcessInfoResolvesLiveAndInaccessibleProcesses() {
     ProcessInfoCache cache;
+    const auto now = std::chrono::steady_clock::time_point{};
 
-    const auto current_process = cache.Resolve(GetCurrentProcessId(), 0);
+    const auto current_process = cache.Resolve(GetCurrentProcessId(), 0, now);
     CHECK_EQ(current_process.id.pid, GetCurrentProcessId());
     CHECK_EQ(current_process.name.empty(), false);
     CHECK_EQ(current_process.id.creation_time_100ns == 0, false);
@@ -1911,14 +1913,15 @@ void TestProcessInfoResolvesLiveAndInaccessibleProcesses() {
     CHECK_EQ(cache.RefreshAlive(wrong_creation_time), false);
 
     constexpr std::uint32_t inaccessible_pid = 0xFFFFFFFFu;
-    const auto inaccessible_process = cache.Resolve(inaccessible_pid, 42);
+    const auto inaccessible_process = cache.Resolve(inaccessible_pid, 42, now);
     CHECK_EQ(inaccessible_process.id.pid, inaccessible_pid);
     CHECK_EQ(inaccessible_process.name, L"受限进程 (4294967295)");
     CHECK_EQ(inaccessible_process.id.creation_time_100ns, 42ULL);
     CHECK_EQ(inaccessible_process.alive, false);
     CHECK_EQ(cache.RefreshAlive(inaccessible_process.id), false);
 
-    const auto same_inaccessible_process = cache.Resolve(inaccessible_pid, 84);
+    const auto same_inaccessible_process =
+        cache.Resolve(inaccessible_pid, 84, now + std::chrono::milliseconds(999));
     CHECK_EQ(same_inaccessible_process.id.creation_time_100ns, 42ULL);
 }
 
@@ -1931,14 +1934,18 @@ void TestProcessInfoFallbackDoesNotMaskRealIdentityOrPidReuse() {
         ProcessInfo{{pid, 600}, L"second.exe", true},
     };
     ProcessInfoCache cache(api);
+    const auto t0 = std::chrono::steady_clock::time_point{};
 
-    const auto fallback = cache.Resolve(pid, 100);
+    const auto fallback = cache.Resolve(pid, 100, t0);
     for (std::uint64_t observation = 101; observation < 108; ++observation) {
-        CHECK_EQ(cache.Resolve(pid, observation).id.creation_time_100ns, 100ULL);
+        CHECK_EQ(cache.Resolve(pid, observation, t0 + std::chrono::milliseconds(
+                                                    observation - 100))
+                     .id.creation_time_100ns,
+                 100ULL);
     }
-    const auto first_real_process = cache.Resolve(pid, 108);
+    const auto first_real_process = cache.Resolve(pid, 108, t0 + std::chrono::seconds(1));
     api.creation_time = 600;
-    const auto reused_pid_process = cache.Resolve(pid, 109);
+    const auto reused_pid_process = cache.Resolve(pid, 109, t0 + std::chrono::seconds(2));
 
     CHECK_EQ(fallback.id.creation_time_100ns, 100ULL);
     CHECK_EQ(first_real_process.id.creation_time_100ns, 500ULL);
@@ -1953,16 +1960,23 @@ void TestProcessInfoCacheUsesCreationTimeOnRealCacheHits() {
     api.query_results = {ProcessInfo{{pid, 500}, L"first.exe", true}};
     api.creation_time = 500;
     ProcessInfoCache cache(api);
+    const auto t0 = std::chrono::steady_clock::time_point{};
 
-    for (std::uint64_t observation = 1; observation <= 5; ++observation) {
-        CHECK_EQ(cache.Resolve(pid, observation).name, L"first.exe");
+    CHECK_EQ(cache.Resolve(pid, 1, t0).name, L"first.exe");
+    for (std::uint64_t observation = 2; observation <= 5; ++observation) {
+        CHECK_EQ(cache.Resolve(pid, observation,
+                               t0 + std::chrono::milliseconds(observation * 100))
+                     .name,
+                 L"first.exe");
     }
 
     CHECK_EQ(api.query_process_calls, 1);
-    CHECK_EQ(api.query_creation_time_calls, 4);
+    CHECK_EQ(api.query_creation_time_calls, 0);
+    CHECK_EQ(cache.Resolve(pid, 6, t0 + std::chrono::seconds(1)).name, L"first.exe");
+    CHECK_EQ(api.query_creation_time_calls, 1);
 }
 
-void TestProcessInfoFallbackDetectsAccessiblePidReuseWithinEightEvents() {
+void TestProcessInfoFallbackRetriesByElapsedTime() {
     constexpr std::uint32_t pid = 4322;
     FakeProcessInfoApi api;
     api.query_results = {
@@ -1970,19 +1984,21 @@ void TestProcessInfoFallbackDetectsAccessiblePidReuseWithinEightEvents() {
         ProcessInfo{{pid, 700}, L"recovered.exe", true},
     };
     ProcessInfoCache cache(api);
+    const auto t0 = std::chrono::steady_clock::time_point{};
 
-    CHECK_EQ(cache.Resolve(pid, 1).alive, false);
-    for (std::uint64_t observation = 2; observation < 9; ++observation) {
-        CHECK_EQ(cache.Resolve(pid, observation).alive, false);
+    CHECK_EQ(cache.Resolve(pid, 1, t0).alive, false);
+    for (std::uint64_t observation = 2; observation < 20; ++observation) {
+        CHECK_EQ(cache.Resolve(pid, observation, t0 + std::chrono::milliseconds(500)).alive,
+                 false);
     }
     CHECK_EQ(api.query_process_calls, 1);
-    const auto reused = cache.Resolve(pid, 9);
+    const auto reused = cache.Resolve(pid, 20, t0 + std::chrono::seconds(1));
     CHECK_EQ(reused.name, L"recovered.exe");
     CHECK_EQ(reused.id.creation_time_100ns, 700ULL);
     CHECK_EQ(api.query_process_calls, 2);
 }
 
-void TestProcessInfoCreationQueryFailureEventuallyDetectsPidReuse() {
+void TestProcessInfoCreationQueryFailuresAdvanceOnlyOncePerSecond() {
     constexpr std::uint32_t pid = 4323;
     FakeProcessInfoApi api;
     api.query_results = {
@@ -1991,12 +2007,25 @@ void TestProcessInfoCreationQueryFailureEventuallyDetectsPidReuse() {
     };
     api.creation_time_results.assign(8, std::nullopt);
     ProcessInfoCache cache(api);
+    const auto t0 = std::chrono::steady_clock::time_point{};
 
-    CHECK_EQ(cache.Resolve(pid, 1).name, L"old.exe");
-    for (std::uint64_t observation = 2; observation < 9; ++observation) {
-        CHECK_EQ(cache.Resolve(pid, observation).name, L"old.exe");
+    CHECK_EQ(cache.Resolve(pid, 1, t0).name, L"old.exe");
+    for (std::uint64_t observation = 2; observation < 20; ++observation) {
+        CHECK_EQ(cache.Resolve(pid, observation, t0 + std::chrono::milliseconds(500)).name,
+                 L"old.exe");
     }
-    CHECK_EQ(cache.Resolve(pid, 9).name, L"new.exe");
+    CHECK_EQ(api.query_creation_time_calls, 0);
+    for (std::uint64_t second = 1; second < 8; ++second) {
+        CHECK_EQ(cache.Resolve(pid, second + 20, t0 + std::chrono::seconds(second)).name,
+                 L"old.exe");
+        CHECK_EQ(cache.Resolve(pid, second + 40,
+                               t0 + std::chrono::seconds(second) +
+                                   std::chrono::milliseconds(500))
+                     .name,
+                 L"old.exe");
+        CHECK_EQ(api.query_creation_time_calls, static_cast<int>(second));
+    }
+    CHECK_EQ(cache.Resolve(pid, 60, t0 + std::chrono::seconds(8)).name, L"new.exe");
     CHECK_EQ(api.query_process_calls, 2);
     CHECK_EQ(api.query_creation_time_calls, 8);
 }
@@ -3642,7 +3671,7 @@ void TestEtwMonitorActualCallbackAggregatesCanonicalConnection() {
         CHECK_EQ(detail_rows_after_receive[0].received_bytes, received_bytes);
     }
     CHECK_EQ(process_api.query_process_calls, 1);
-    CHECK_EQ(process_api.query_creation_time_calls, 1);
+    CHECK_EQ(process_api.query_creation_time_calls, 0);
     monitor.Stop();
 }
 
@@ -4252,8 +4281,8 @@ int main(int argc, char** argv) {
     TestProcessInfoResolvesLiveAndInaccessibleProcesses();
     TestProcessInfoFallbackDoesNotMaskRealIdentityOrPidReuse();
     TestProcessInfoCacheUsesCreationTimeOnRealCacheHits();
-    TestProcessInfoFallbackDetectsAccessiblePidReuseWithinEightEvents();
-    TestProcessInfoCreationQueryFailureEventuallyDetectsPidReuse();
+    TestProcessInfoFallbackRetriesByElapsedTime();
+    TestProcessInfoCreationQueryFailuresAdvanceOnlyOncePerSecond();
     TestSingleInstanceGuardRejectsSecondOwnerAndReleasesName();
     TestEtwMonitorStartsOneConfiguredConsumer();
     TestEtwMonitorStopsOnlyOwnedResourcesAndStopIsIdempotent();

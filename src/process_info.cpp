@@ -89,9 +89,14 @@ ProcessInfoCache::ProcessInfoCache() : ProcessInfoCache(DefaultProcessInfoApi())
 ProcessInfoCache::ProcessInfoCache(IProcessInfoApi& process_api) : process_api_(process_api) {}
 
 ProcessInfo ProcessInfoCache::Resolve(std::uint32_t pid,
-                                      std::uint64_t fallback_observation_id) {
+                                      std::uint64_t fallback_observation_id,
+                                      std::chrono::steady_clock::time_point now) {
     auto cached = cache_.find(pid);
     if (cached != cache_.end()) {
+        if (now - cached->second.last_validation < std::chrono::seconds(1)) {
+            return cached->second.info;
+        }
+        cached->second.last_validation = now;
         const auto creation_time = process_api_.QueryCreationTime(pid);
         if (creation_time &&
             *creation_time == cached->second.info.id.creation_time_100ns) {
@@ -104,39 +109,39 @@ ProcessInfo ProcessInfoCache::Resolve(std::uint32_t pid,
 
         const auto process = process_api_.QueryProcess(pid);
         if (process) {
-            cached->second = {*process, 0};
+            cached->second = {*process, 0, now};
             return *process;
         }
         cache_.erase(cached);
         auto [fallback, inserted] = fallback_cache_.try_emplace(
-            pid, FallbackEntry{FallbackProcess(pid, fallback_observation_id)});
+            pid, FallbackEntry{FallbackProcess(pid, fallback_observation_id), now});
         if (!inserted) {
-            fallback->second = {FallbackProcess(pid, fallback_observation_id)};
+            fallback->second = {FallbackProcess(pid, fallback_observation_id), now};
         }
         return fallback->second.info;
     }
 
     auto fallback = fallback_cache_.find(pid);
     if (fallback != fallback_cache_.end() &&
-        fallback->second.observations_before_retry != 0) {
-        --fallback->second.observations_before_retry;
+        now - fallback->second.last_attempt < std::chrono::seconds(1)) {
         return fallback->second.info;
     }
 
     const auto process = process_api_.QueryProcess(pid);
     if (process) {
         fallback_cache_.erase(pid);
-        cache_[pid] = {*process, 0};
+        cache_[pid] = {*process, 0, now};
         return *process;
     }
 
     if (fallback == fallback_cache_.end()) {
         fallback = fallback_cache_
                        .try_emplace(pid,
-                                    FallbackEntry{FallbackProcess(pid, fallback_observation_id)})
+                                    FallbackEntry{FallbackProcess(pid, fallback_observation_id),
+                                                  now})
                        .first;
     } else {
-        fallback->second.observations_before_retry = 7;
+        fallback->second.last_attempt = now;
     }
     return fallback->second.info;
 }
