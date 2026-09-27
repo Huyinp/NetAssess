@@ -125,6 +125,18 @@ public:
         if (dependencies_.save_csv == nullptr) {
             dependencies_.save_csv = SaveCsvWithDialog;
         }
+        if (!dependencies_.monotonic_now) {
+            dependencies_.monotonic_now = [] {
+                return std::chrono::steady_clock::now();
+            };
+        }
+        if (!dependencies_.retention_probe) {
+            dependencies_.retention_probe = [this](ProcessInstanceId process) {
+                return process_cache_.ProbeAlive(process);
+            };
+        }
+        next_retention_cleanup_ =
+            dependencies_.monotonic_now() + std::chrono::minutes(10);
     }
 
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wparam,
@@ -552,10 +564,40 @@ private:
     }
 
     void RefreshSnapshot() {
-        last_snapshot_ = aggregator_.Snapshot(std::chrono::steady_clock::now());
+        const auto now = dependencies_.monotonic_now();
+        RunRetentionCleanup(now);
+        last_snapshot_ = aggregator_.Snapshot(now);
         RefreshRows();
         UpdateStatus();
         RefreshConnectionWindows();
+    }
+
+    void RunRetentionCleanup(std::chrono::steady_clock::time_point now) {
+        if (now < next_retention_cleanup_) {
+            return;
+        }
+        next_retention_cleanup_ = now + std::chrono::minutes(10);
+
+        auto latest_activity = aggregator_.LatestActivityByProcess();
+        for (const auto& [process, connection_activity] :
+             connection_aggregator_.LatestActivityByProcess()) {
+            auto [position, inserted] =
+                latest_activity.try_emplace(process, connection_activity);
+            if (!inserted) {
+                position->second = std::max(position->second, connection_activity);
+            }
+        }
+
+        const auto cutoff = now - std::chrono::hours(24 * 7);
+        std::vector<ProcessInstanceId> ended;
+        for (const auto& [process, last_activity] : latest_activity) {
+            if (last_activity < cutoff &&
+                dependencies_.retention_probe(process) == ProcessProbeResult::Ended) {
+                ended.push_back(process);
+            }
+        }
+        aggregator_.RemoveProcesses(ended);
+        connection_aggregator_.RemoveProcesses(ended);
     }
 
     void RefreshRows() {
@@ -786,6 +828,7 @@ private:
     std::vector<TrafficKey> current_keys_;
     std::map<TrafficKey, int> row_map_;
     std::map<ProcessInstanceId, HWND> connection_windows_;
+    std::chrono::steady_clock::time_point next_retention_cleanup_;
 };
 
 bool RegisterWindowClass(HINSTANCE instance) {
@@ -820,9 +863,15 @@ std::vector<TrafficDisplayRow> BuildVisibleRows(
     const std::function<bool(ProcessInstanceId)>& alive_lookup) {
     std::vector<TrafficDisplayRow> rows;
     rows.reserve(snapshots.size());
+    std::map<ProcessInstanceId, bool> alive_by_process;
     for (const TrafficSnapshot& snapshot : snapshots) {
         if (ContainsCaseInsensitive(snapshot.process_name, filter)) {
-            rows.push_back({snapshot, alive_lookup(snapshot.key.process)});
+            auto [position, inserted] =
+                alive_by_process.try_emplace(snapshot.key.process, false);
+            if (inserted) {
+                position->second = alive_lookup(snapshot.key.process);
+            }
+            rows.push_back({snapshot, position->second});
         }
     }
     SortTrafficRows(rows, sort_column, ascending);

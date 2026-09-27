@@ -25,6 +25,8 @@ public:
                                              std::chrono::steady_clock::time_point now);
     std::vector<ProcessInstanceId> ProcessesInactiveBefore(
         std::chrono::steady_clock::time_point cutoff) const;
+    std::map<ProcessInstanceId, std::chrono::steady_clock::time_point>
+        LatestActivityByProcess() const;
     void RemoveProcesses(std::span<const ProcessInstanceId> processes);
     void ResetSnapshotBaseline(ProcessInstanceId process);
     void Clear();

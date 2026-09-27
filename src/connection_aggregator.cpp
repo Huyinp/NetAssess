@@ -134,6 +134,18 @@ std::vector<ConnectionSnapshot> ConnectionAggregator::Snapshot(
 
 std::vector<ProcessInstanceId> ConnectionAggregator::ProcessesInactiveBefore(
     std::chrono::steady_clock::time_point cutoff) const {
+    const auto newest_activity = LatestActivityByProcess();
+    std::vector<ProcessInstanceId> inactive;
+    for (const auto& [process, last_activity] : newest_activity) {
+        if (last_activity < cutoff) {
+            inactive.push_back(process);
+        }
+    }
+    return inactive;
+}
+
+std::map<ProcessInstanceId, std::chrono::steady_clock::time_point>
+ConnectionAggregator::LatestActivityByProcess() const {
     std::lock_guard lock(mutex_);
     std::map<ProcessInstanceId, std::chrono::steady_clock::time_point> newest_activity;
     for (const auto& [key, entry] : entries_) {
@@ -144,13 +156,7 @@ std::vector<ProcessInstanceId> ConnectionAggregator::ProcessesInactiveBefore(
         }
     }
 
-    std::vector<ProcessInstanceId> inactive;
-    for (const auto& [process, last_activity] : newest_activity) {
-        if (last_activity < cutoff) {
-            inactive.push_back(process);
-        }
-    }
-    return inactive;
+    return newest_activity;
 }
 
 void ConnectionAggregator::RemoveProcesses(

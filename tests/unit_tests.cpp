@@ -2024,6 +2024,32 @@ void TestVisibleRowsFilterWithoutMutatingSnapshotAndAttachLiveness() {
     CHECK_EQ(snapshots[1].process_name, L"beta.exe");
 }
 
+void TestVisibleRowsQueriesEachProcessOncePerRefresh() {
+    const ProcessInstanceId repeated{104, 44};
+    const ProcessInstanceId other{105, 55};
+    const std::vector<TrafficSnapshot> snapshots{
+        MakeSnapshot({repeated, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls},
+                     L"same.exe", 1.0, 0.0),
+        MakeSnapshot({repeated, TransportProtocol::Udp, ApplicationProtocol::Quic},
+                     L"same.exe", 2.0, 0.0),
+        MakeSnapshot({other, TransportProtocol::Tcp, ApplicationProtocol::Http},
+                     L"other.exe", 3.0, 0.0),
+    };
+    std::map<ProcessInstanceId, int> calls;
+
+    const auto rows = BuildVisibleRows(
+        snapshots, L"", SortColumn::CombinedSpeed, false,
+        [&](ProcessInstanceId process) {
+            ++calls[process];
+            return process == repeated;
+        });
+
+    CHECK_EQ(rows.size(), 3U);
+    CHECK_EQ(calls.size(), 2U);
+    CHECK_EQ(calls[repeated], 1);
+    CHECK_EQ(calls[other], 1);
+}
+
 void TestProcessRateTotalsSumEveryCapturedProcess() {
     const std::array snapshots{
         MakeSnapshot({{1, 1}, TransportProtocol::Tcp, ApplicationProtocol::Http},
@@ -2938,6 +2964,112 @@ void TestMainWindowShowsProcessRateTotals() {
     };
     CHECK_EQ(status_text().find(L"进程总网速：↑ 0 B/s ↓ 0 B/s 合计 0 B/s") !=
                  std::wstring::npos, true);
+    DestroyWindow(window);
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
+}
+
+void TestMainWindowRunsSevenDayCleanupEveryTenMinutes() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
+    CHECK_EQ(InitCommonControlsEx(&controls), TRUE);
+    TrafficAggregator traffic;
+    ConnectionAggregator connections;
+    FakeProcessInfoApi process_api;
+    ProcessInfoCache cache(process_api);
+    FakeEtwSessionApi etw_api;
+    EtwMonitor etw(traffic, connections, cache, etw_api);
+    const auto base = std::chrono::steady_clock::time_point{} + std::chrono::hours(24 * 20);
+    const auto old = base - std::chrono::hours(24 * 8);
+    auto current = base;
+    const ProcessInstanceId ended{6101, 1};
+    const ProcessInstanceId running{6102, 1};
+    const ProcessInstanceId unknown{6103, 1};
+    const ProcessInstanceId recent_elsewhere{6104, 1};
+    const ProcessInstanceId ended_later{6105, 1};
+    traffic.Add({{ended, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls},
+                 L"ended.exe", TrafficDirection::Send, 1, old});
+    traffic.Add({{running, TransportProtocol::Tcp, ApplicationProtocol::Http},
+                 L"running.exe", TrafficDirection::Send, 1, old});
+    traffic.Add({{recent_elsewhere, TransportProtocol::Tcp, ApplicationProtocol::Http},
+                 L"cross.exe", TrafficDirection::Send, 1, old});
+    connections.Add({
+        MakeConnectionKey(ended, TransportProtocol::Tcp,
+                          ApplicationProtocol::HttpsTls, 50000, 443),
+        L"ended.exe", TrafficDirection::Send, 1, old});
+    connections.Add({
+        MakeConnectionKey(unknown, TransportProtocol::Udp,
+                          ApplicationProtocol::Dns, 50001, 53),
+        L"unknown.exe", TrafficDirection::Send, 1, old});
+    connections.Add({
+        MakeConnectionKey(recent_elsewhere, TransportProtocol::Tcp,
+                          ApplicationProtocol::Http, 50002, 80),
+        L"cross.exe", TrafficDirection::Send, 1, base});
+
+    std::map<ProcessInstanceId, ProcessProbeResult> results{
+        {ended, ProcessProbeResult::Ended},
+        {running, ProcessProbeResult::Running},
+        {unknown, ProcessProbeResult::Unknown},
+        {recent_elsewhere, ProcessProbeResult::Ended},
+        {ended_later, ProcessProbeResult::Ended},
+    };
+    std::map<ProcessInstanceId, int> probe_calls;
+    MainWindowDependencies dependencies{};
+    dependencies.monotonic_now = [&] { return current; };
+    dependencies.retention_probe = [&](ProcessInstanceId process) {
+        ++probe_calls[process];
+        return results.at(process);
+    };
+    HWND window = CreateMainWindow(GetModuleHandleW(nullptr), traffic, connections,
+                                   cache, etw, dependencies);
+    CHECK_EQ(window != nullptr, true);
+    if (window == nullptr) { return; }
+
+    current = base + std::chrono::minutes(9);
+    SendMessageW(window, WM_TIMER, 1, 0);
+    CHECK_EQ(probe_calls.empty(), true);
+    CHECK_EQ(traffic.Snapshot(current).size(), 3U);
+
+    current = base + std::chrono::minutes(10);
+    SendMessageW(window, WM_TIMER, 1, 0);
+    CHECK_EQ(probe_calls[ended], 1);
+    CHECK_EQ(probe_calls[running], 1);
+    CHECK_EQ(probe_calls[unknown], 1);
+    CHECK_EQ(probe_calls.contains(recent_elsewhere), false);
+    const auto retained_traffic = traffic.Snapshot(current);
+    CHECK_EQ(std::any_of(retained_traffic.begin(), retained_traffic.end(),
+                         [ended](const TrafficSnapshot& row) {
+                             return row.key.process == ended;
+                         }),
+             false);
+    CHECK_EQ(std::any_of(retained_traffic.begin(), retained_traffic.end(),
+                         [running](const TrafficSnapshot& row) {
+                             return row.key.process == running;
+                         }),
+             true);
+    CHECK_EQ(std::any_of(retained_traffic.begin(), retained_traffic.end(),
+                         [recent_elsewhere](const TrafficSnapshot& row) {
+                             return row.key.process == recent_elsewhere;
+                         }),
+             true);
+    CHECK_EQ(connections.Snapshot(ended, current).empty(), true);
+    CHECK_EQ(connections.Snapshot(unknown, current).size(), 1U);
+    CHECK_EQ(connections.Snapshot(recent_elsewhere, current).size(), 1U);
+
+    traffic.Add({{ended_later, TransportProtocol::Tcp, ApplicationProtocol::Http},
+                 L"later.exe", TrafficDirection::Send, 1, old});
+    current = base + std::chrono::minutes(19);
+    SendMessageW(window, WM_TIMER, 1, 0);
+    CHECK_EQ(probe_calls.contains(ended_later), false);
+    current = base + std::chrono::minutes(20);
+    SendMessageW(window, WM_TIMER, 1, 0);
+    CHECK_EQ(probe_calls[ended_later], 1);
+    const auto final_traffic = traffic.Snapshot(current);
+    CHECK_EQ(std::any_of(final_traffic.begin(), final_traffic.end(),
+                         [ended_later](const TrafficSnapshot& row) {
+                             return row.key.process == ended_later;
+                         }),
+             false);
+
     DestroyWindow(window);
     MSG message{};
     while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
@@ -4538,6 +4670,7 @@ int main(int argc, char** argv) {
     TestTrafficFormatting();
     TestTrafficRowsSortByCombinedSpeedAndColumnsDeterministically();
     TestVisibleRowsFilterWithoutMutatingSnapshotAndAttachLiveness();
+    TestVisibleRowsQueriesEachProcessOncePerRefresh();
     TestProcessRateTotalsSumEveryCapturedProcess();
     TestVisibleRowsDefaultOrderUsesCombinedSpeedDescending();
     TestVisibleRowsUsesInvariantUnicodeCaseInsensitiveFilter();
@@ -4566,6 +4699,7 @@ int main(int argc, char** argv) {
     TestMainWindowRoutesProcessActionsAndExportsVisibleRows();
     TestMainWindowMouseActionKeepsClickedProcessAcrossMenuAndConfirmationRefresh();
     TestMainWindowShowsProcessRateTotals();
+    TestMainWindowRunsSevenDayCleanupEveryTenMinutes();
     TestMainWindowKeepsManualScrollAndResetsForSortAndFilter();
     TestConnectionCreationPreservesErrorAcrossDestruction();
     TestConnectionCreationDoesNotUseStaleSubclassFailureError();

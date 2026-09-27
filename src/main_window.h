@@ -24,6 +24,7 @@ class ProcessInfoCache;
 class TrafficAggregator;
 class ProcessActions;
 struct CsvSaveResult;
+enum class ProcessProbeResult;
 
 struct TrafficRateTotals {
     double sent_bytes_per_second{};
@@ -38,6 +39,8 @@ struct MainWindowDependencies {
     CsvSaveResult (*save_csv)(HWND, std::wstring_view,
                               std::span<const std::wstring>,
                               std::span<const std::vector<std::wstring>>){};
+    std::function<std::chrono::steady_clock::time_point()> monotonic_now;
+    std::function<ProcessProbeResult(ProcessInstanceId)> retention_probe;
 };
 
 TrafficRateTotals SumTrafficRates(std::span<const TrafficSnapshot> snapshots);
