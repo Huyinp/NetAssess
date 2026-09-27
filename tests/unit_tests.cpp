@@ -739,6 +739,31 @@ void TestTrafficAggregationKeepsDistinctKeysAndDirectionsSeparate() {
     CHECK_EQ(FindSnapshot(snapshots, different_transport_and_protocol).received_bytes, 400ULL);
 }
 
+void TestTrafficAggregationKeepsNewestActivityPerProcess() {
+    TrafficAggregator aggregator;
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const ProcessInstanceId process{102, 9};
+    const TrafficKey tcp{process, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls};
+    const TrafficKey udp{process, TransportProtocol::Udp, ApplicationProtocol::Quic};
+
+    aggregator.Add({tcp, L"browser.exe", TrafficDirection::Send, 1,
+                    t0 + std::chrono::seconds(10)});
+    aggregator.Add({udp, L"browser.exe", TrafficDirection::Receive, 1,
+                    t0 + std::chrono::seconds(20)});
+    aggregator.Add({tcp, L"browser.exe", TrafficDirection::Send, 1,
+                    t0 + std::chrono::seconds(5)});
+
+    CHECK_EQ(aggregator.ProcessesInactiveBefore(t0 + std::chrono::seconds(20)).empty(),
+             true);
+    const auto inactive =
+        aggregator.ProcessesInactiveBefore(t0 + std::chrono::seconds(21));
+    CHECK_EQ(inactive.size(), 1U);
+    if (!inactive.empty()) {
+        CHECK_EQ(inactive[0].pid, process.pid);
+        CHECK_EQ(inactive[0].creation_time_100ns, process.creation_time_100ns);
+    }
+}
+
 void TestConnectionAggregationUsesAllEndpointAndProtocolFields() {
     ConnectionAggregator aggregator;
     const ProcessInstanceId process{100, 1};
@@ -3715,6 +3740,7 @@ void TestEtwMonitorCallbackContainsLateSubmissionExceptionsAndStopsSafely() {
     FakeEtwSessionApi api;
     bool traffic_submitted{};
     bool connection_submitted{};
+    bool matching_observation_times{};
     EtwMonitor monitor(
         traffic_aggregator, connection_aggregator, process_cache, api,
         [](const EVENT_RECORD&) -> std::optional<EventLayout> {
@@ -3726,6 +3752,8 @@ void TestEtwMonitorCallbackContainsLateSubmissionExceptionsAndStopsSafely() {
             traffic_submitted = true;
             connections.Add(connection_event);
             connection_submitted = true;
+            matching_observation_times =
+                traffic_event.observed_at == connection_event.observed_at;
             throw std::runtime_error("submission failure");
         });
     CHECK_EQ(monitor.Start(), true);
@@ -3750,6 +3778,7 @@ void TestEtwMonitorCallbackContainsLateSubmissionExceptionsAndStopsSafely() {
 
     CHECK_EQ(traffic_submitted, true);
     CHECK_EQ(connection_submitted, true);
+    CHECK_EQ(matching_observation_times, true);
     const auto traffic_rows = traffic_aggregator.Snapshot(t0);
     CHECK_EQ(traffic_rows.size(), 1ULL);
     if (!traffic_rows.empty()) {
@@ -4241,6 +4270,7 @@ int main(int argc, char** argv) {
     CHECK_EQ(ApplicationProtocolName(ApplicationProtocol::Other), L"其他");
 
     TestTrafficAggregationKeepsDistinctKeysAndDirectionsSeparate();
+    TestTrafficAggregationKeepsNewestActivityPerProcess();
     TestConnectionAggregationUsesAllEndpointAndProtocolFields();
     TestConnectionAggregationSaturatesDirectionalCounters();
     TestConnectionSnapshotsKeepProcessBaselinesIndependent();

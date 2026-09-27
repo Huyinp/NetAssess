@@ -1,5 +1,6 @@
 #include "traffic_aggregator.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <utility>
 
@@ -15,6 +16,7 @@ void TrafficAggregator::Add(const TrafficEvent& event) {
     std::lock_guard lock(mutex_);
     auto& entry = entries_[event.key];
     entry.process_name = event.process_name;
+    entry.last_activity = std::max(entry.last_activity, event.observed_at);
     if (event.direction == TrafficDirection::Send) {
         entry.sent_bytes = SaturatingAdd(entry.sent_bytes, event.bytes);
     } else {
@@ -54,6 +56,27 @@ std::vector<TrafficSnapshot> TrafficAggregator::Snapshot(
         previous_snapshot_time_ = now;
     }
     return snapshots;
+}
+
+std::vector<ProcessInstanceId> TrafficAggregator::ProcessesInactiveBefore(
+    std::chrono::steady_clock::time_point cutoff) const {
+    std::lock_guard lock(mutex_);
+    std::map<ProcessInstanceId, std::chrono::steady_clock::time_point> newest_activity;
+    for (const auto& [key, entry] : entries_) {
+        auto [position, inserted] =
+            newest_activity.try_emplace(key.process, entry.last_activity);
+        if (!inserted) {
+            position->second = std::max(position->second, entry.last_activity);
+        }
+    }
+
+    std::vector<ProcessInstanceId> inactive;
+    for (const auto& [process, last_activity] : newest_activity) {
+        if (last_activity < cutoff) {
+            inactive.push_back(process);
+        }
+    }
+    return inactive;
 }
 
 void TrafficAggregator::Clear() {

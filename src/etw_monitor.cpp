@@ -397,7 +397,7 @@ void EtwMonitor::HandleEvent(const EVENT_RECORD& record) {
         decoded->destination_port);
     const TrafficEvent traffic_event{
         {process.id, decoded->transport, application_protocol}, process.name,
-        decoded->direction, decoded->bytes};
+        decoded->direction, decoded->bytes, observed_at};
     const ConnectionEvent connection_event{
         BuildConnectionKey(process.id, decoded->transport, application_protocol,
                            decoded->direction, decoded->source_address,

@@ -70,6 +70,7 @@ struct TrafficEvent {
     std::wstring process_name;
     TrafficDirection direction{};
     std::uint64_t bytes{};
+    std::chrono::steady_clock::time_point observed_at;
 };
 
 struct TrafficSnapshot {
