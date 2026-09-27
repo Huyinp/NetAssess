@@ -1,5 +1,6 @@
 #include "connection_aggregator.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <utility>
@@ -87,6 +88,39 @@ std::vector<ConnectionSnapshot> ConnectionAggregator::Snapshot(
         previous_snapshot_times_[process] = now;
     }
     return snapshots;
+}
+
+std::vector<ProcessInstanceId> ConnectionAggregator::ProcessesInactiveBefore(
+    std::chrono::steady_clock::time_point cutoff) const {
+    std::lock_guard lock(mutex_);
+    std::map<ProcessInstanceId, std::chrono::steady_clock::time_point> newest_activity;
+    for (const auto& [key, entry] : entries_) {
+        auto [position, inserted] =
+            newest_activity.try_emplace(key.process, entry.last_activity);
+        if (!inserted) {
+            position->second = std::max(position->second, entry.last_activity);
+        }
+    }
+
+    std::vector<ProcessInstanceId> inactive;
+    for (const auto& [process, last_activity] : newest_activity) {
+        if (last_activity < cutoff) {
+            inactive.push_back(process);
+        }
+    }
+    return inactive;
+}
+
+void ConnectionAggregator::RemoveProcesses(
+    std::span<const ProcessInstanceId> processes) {
+    std::lock_guard lock(mutex_);
+    std::erase_if(entries_, [processes](const auto& item) {
+        return std::find(processes.begin(), processes.end(), item.first.process) !=
+               processes.end();
+    });
+    for (const ProcessInstanceId process : processes) {
+        previous_snapshot_times_.erase(process);
+    }
 }
 
 void ConnectionAggregator::ResetSnapshotBaseline(ProcessInstanceId process) {

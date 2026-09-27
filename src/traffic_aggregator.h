@@ -6,6 +6,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <vector>
 
 class TrafficAggregator {
@@ -14,6 +15,7 @@ public:
     std::vector<TrafficSnapshot> Snapshot(std::chrono::steady_clock::time_point now);
     std::vector<ProcessInstanceId> ProcessesInactiveBefore(
         std::chrono::steady_clock::time_point cutoff) const;
+    void RemoveProcesses(std::span<const ProcessInstanceId> processes);
     void Clear();
 
 private:

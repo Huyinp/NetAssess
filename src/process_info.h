@@ -14,11 +14,18 @@ struct ProcessInfo {
     bool alive{};
 };
 
+enum class ProcessProbeResult {
+    Running,
+    Ended,
+    Unknown,
+};
+
 class IProcessInfoApi {
 public:
     virtual ~IProcessInfoApi() = default;
     virtual std::optional<ProcessInfo> QueryProcess(std::uint32_t pid) = 0;
     virtual std::optional<std::uint64_t> QueryCreationTime(std::uint32_t pid) = 0;
+    virtual ProcessProbeResult ProbeProcess(ProcessInstanceId id) = 0;
 };
 
 class ProcessInfoCache {
@@ -28,6 +35,7 @@ public:
 
     ProcessInfo Resolve(std::uint32_t pid, std::uint64_t fallback_observation_id,
                         std::chrono::steady_clock::time_point now);
+    ProcessProbeResult ProbeAlive(ProcessInstanceId id) const;
     bool RefreshAlive(ProcessInstanceId id) const;
 
 private:

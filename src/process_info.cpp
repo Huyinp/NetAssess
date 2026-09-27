@@ -62,6 +62,27 @@ std::optional<std::uint64_t> QueryWindowsCreationTime(std::uint32_t pid) {
     return creation_time;
 }
 
+ProcessProbeResult ProbeWindowsProcess(ProcessInstanceId id) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, id.pid);
+    if (process == nullptr) {
+        return GetLastError() == ERROR_INVALID_PARAMETER
+                   ? ProcessProbeResult::Ended
+                   : ProcessProbeResult::Unknown;
+    }
+
+    const auto creation_time = ProcessCreationTime(process);
+    DWORD exit_code{};
+    const bool got_exit_code = GetExitCodeProcess(process, &exit_code) != FALSE;
+    CloseHandle(process);
+    if (!creation_time || !got_exit_code) {
+        return ProcessProbeResult::Unknown;
+    }
+    if (*creation_time != id.creation_time_100ns || exit_code != STILL_ACTIVE) {
+        return ProcessProbeResult::Ended;
+    }
+    return ProcessProbeResult::Running;
+}
+
 ProcessInfo FallbackProcess(std::uint32_t pid, std::uint64_t fallback_observation_id) {
     return {{pid, fallback_observation_id}, L"受限进程 (" + std::to_wstring(pid) + L")", false};
 }
@@ -74,6 +95,10 @@ public:
 
     std::optional<std::uint64_t> QueryCreationTime(std::uint32_t pid) override {
         return QueryWindowsCreationTime(pid);
+    }
+
+    ProcessProbeResult ProbeProcess(ProcessInstanceId id) override {
+        return ProbeWindowsProcess(id);
     }
 };
 
@@ -146,7 +171,10 @@ ProcessInfo ProcessInfoCache::Resolve(std::uint32_t pid,
     return fallback->second.info;
 }
 
+ProcessProbeResult ProcessInfoCache::ProbeAlive(ProcessInstanceId id) const {
+    return process_api_.ProbeProcess(id);
+}
+
 bool ProcessInfoCache::RefreshAlive(ProcessInstanceId id) const {
-    const auto creation_time = process_api_.QueryCreationTime(id.pid);
-    return creation_time && *creation_time == id.creation_time_100ns;
+    return ProbeAlive(id) == ProcessProbeResult::Running;
 }

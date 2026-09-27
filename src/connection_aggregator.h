@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <span>
 #include <vector>
 
 ConnectionKey BuildConnectionKey(ProcessInstanceId process, TransportProtocol transport,
@@ -22,6 +23,9 @@ public:
     void Add(const ConnectionEvent& event);
     std::vector<ConnectionSnapshot> Snapshot(ProcessInstanceId process,
                                              std::chrono::steady_clock::time_point now);
+    std::vector<ProcessInstanceId> ProcessesInactiveBefore(
+        std::chrono::steady_clock::time_point cutoff) const;
+    void RemoveProcesses(std::span<const ProcessInstanceId> processes);
     void ResetSnapshotBaseline(ProcessInstanceId process);
     void Clear();
     std::uint64_t dropped_detail_events() const;

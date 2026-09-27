@@ -79,6 +79,15 @@ std::vector<ProcessInstanceId> TrafficAggregator::ProcessesInactiveBefore(
     return inactive;
 }
 
+void TrafficAggregator::RemoveProcesses(
+    std::span<const ProcessInstanceId> processes) {
+    std::lock_guard lock(mutex_);
+    std::erase_if(entries_, [processes](const auto& item) {
+        return std::find(processes.begin(), processes.end(), item.first.process) !=
+               processes.end();
+    });
+}
+
 void TrafficAggregator::Clear() {
     std::lock_guard lock(mutex_);
     entries_.clear();

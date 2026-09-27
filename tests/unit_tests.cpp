@@ -450,6 +450,17 @@ public:
         return creation_time;
     }
 
+    ProcessProbeResult ProbeProcess(ProcessInstanceId id) override {
+        ++probe_process_calls;
+        if (probe_result) {
+            return *probe_result;
+        }
+        if (!creation_time || *creation_time != id.creation_time_100ns) {
+            return ProcessProbeResult::Ended;
+        }
+        return ProcessProbeResult::Running;
+    }
+
     std::vector<std::optional<ProcessInfo>> query_results;
     std::size_t query_index{};
     std::optional<std::uint64_t> creation_time;
@@ -457,6 +468,8 @@ public:
     std::size_t creation_time_index{};
     int query_process_calls{};
     int query_creation_time_calls{};
+    std::optional<ProcessProbeResult> probe_result;
+    int probe_process_calls{};
 };
 
 class FakeProcessActionApi final : public IProcessActionApi {
@@ -764,6 +777,29 @@ void TestTrafficAggregationKeepsNewestActivityPerProcess() {
     }
 }
 
+void TestTrafficRetentionRemovesOnlySelectedProcess() {
+    TrafficAggregator aggregator;
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const ProcessInstanceId removed{103, 10};
+    const ProcessInstanceId retained{104, 11};
+    aggregator.Add({{removed, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls},
+                    L"old.exe", TrafficDirection::Send, 10, t0});
+    aggregator.Add({{removed, TransportProtocol::Udp, ApplicationProtocol::Dns},
+                    L"old.exe", TrafficDirection::Receive, 20, t0});
+    aggregator.Add({{retained, TransportProtocol::Tcp, ApplicationProtocol::Http},
+                    L"live.exe", TrafficDirection::Send, 30, t0});
+
+    const std::array processes{removed};
+    aggregator.RemoveProcesses(processes);
+
+    const auto rows = aggregator.Snapshot(t0);
+    CHECK_EQ(rows.size(), 1U);
+    if (!rows.empty()) {
+        CHECK_EQ(rows[0].key.process.pid, retained.pid);
+        CHECK_EQ(rows[0].sent_bytes, 30ULL);
+    }
+}
+
 void TestConnectionAggregationUsesAllEndpointAndProtocolFields() {
     ConnectionAggregator aggregator;
     const ProcessInstanceId process{100, 1};
@@ -944,6 +980,48 @@ void TestConnectionClearResetsProcessSnapshotTimeBaseline() {
                                     key)
                  .sent_bytes_per_second,
              3.0);
+}
+
+void TestConnectionRetentionUsesNewestActivityAndClearsBaseline() {
+    ConnectionAggregator aggregator;
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const ProcessInstanceId removed{106, 1};
+    const ProcessInstanceId retained{107, 1};
+    const auto old_first = MakeConnectionKey(
+        removed, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls, 50000, 443);
+    const auto old_second = MakeConnectionKey(
+        removed, TransportProtocol::Udp, ApplicationProtocol::Dns, 50001, 53);
+    const auto live = MakeConnectionKey(
+        retained, TransportProtocol::Tcp, ApplicationProtocol::Http, 50002, 80);
+    aggregator.Add({old_first, L"old.exe", TrafficDirection::Send, 10,
+                    t0 + std::chrono::seconds(10)});
+    aggregator.Add({old_second, L"old.exe", TrafficDirection::Receive, 20,
+                    t0 + std::chrono::seconds(20)});
+    aggregator.Add({old_first, L"old.exe", TrafficDirection::Send, 1,
+                    t0 + std::chrono::seconds(5)});
+    aggregator.Add({live, L"live.exe", TrafficDirection::Send, 30,
+                    t0 + std::chrono::seconds(20)});
+
+    CHECK_EQ(aggregator.ProcessesInactiveBefore(t0 + std::chrono::seconds(20)).empty(),
+             true);
+    const auto inactive =
+        aggregator.ProcessesInactiveBefore(t0 + std::chrono::seconds(21));
+    CHECK_EQ(inactive.size(), 2U);
+
+    aggregator.Snapshot(removed, t0 + std::chrono::seconds(30));
+    const std::array processes{removed};
+    aggregator.RemoveProcesses(processes);
+    CHECK_EQ(aggregator.Snapshot(removed, t0 + std::chrono::seconds(31)).empty(), true);
+    CHECK_EQ(aggregator.Snapshot(retained, t0 + std::chrono::seconds(31)).size(), 1U);
+
+    aggregator.Add({old_first, L"old.exe", TrafficDirection::Send, 5,
+                    t0 + std::chrono::seconds(32)});
+    const auto restored =
+        aggregator.Snapshot(removed, t0 + std::chrono::seconds(33));
+    CHECK_EQ(restored.size(), 1U);
+    if (!restored.empty()) {
+        CHECK_EQ(restored[0].sent_bytes_per_second, 0.0);
+    }
 }
 
 void TestConnectionAggregationDefaultCapacityIsOneHundredThousand() {
@@ -2053,6 +2131,23 @@ void TestProcessInfoCreationQueryFailuresAdvanceOnlyOncePerSecond() {
     CHECK_EQ(cache.Resolve(pid, 60, t0 + std::chrono::seconds(8)).name, L"new.exe");
     CHECK_EQ(api.query_process_calls, 2);
     CHECK_EQ(api.query_creation_time_calls, 8);
+}
+
+void TestProcessInfoProbePreservesRunningEndedAndUnknown() {
+    FakeProcessInfoApi api;
+    ProcessInfoCache cache(api);
+    const ProcessInstanceId process{4324, 1000};
+
+    api.probe_result = ProcessProbeResult::Running;
+    CHECK_EQ(static_cast<int>(cache.ProbeAlive(process)),
+             static_cast<int>(ProcessProbeResult::Running));
+    api.probe_result = ProcessProbeResult::Ended;
+    CHECK_EQ(static_cast<int>(cache.ProbeAlive(process)),
+             static_cast<int>(ProcessProbeResult::Ended));
+    api.probe_result = ProcessProbeResult::Unknown;
+    CHECK_EQ(static_cast<int>(cache.ProbeAlive(process)),
+             static_cast<int>(ProcessProbeResult::Unknown));
+    CHECK_EQ(api.probe_process_calls, 3);
 }
 
 void TestSingleInstanceGuardRejectsSecondOwnerAndReleasesName() {
@@ -4271,11 +4366,13 @@ int main(int argc, char** argv) {
 
     TestTrafficAggregationKeepsDistinctKeysAndDirectionsSeparate();
     TestTrafficAggregationKeepsNewestActivityPerProcess();
+    TestTrafficRetentionRemovesOnlySelectedProcess();
     TestConnectionAggregationUsesAllEndpointAndProtocolFields();
     TestConnectionAggregationSaturatesDirectionalCounters();
     TestConnectionSnapshotsKeepProcessBaselinesIndependent();
     TestConnectionAggregationBoundsEntriesAndClearsState();
     TestConnectionClearResetsProcessSnapshotTimeBaseline();
+    TestConnectionRetentionUsesNewestActivityAndClearsBaseline();
     TestConnectionAggregationDefaultCapacityIsOneHundredThousand();
     TestEtwPayloadDecodeIsBoundedAndUsesNetworkOrderPorts();
     TestEtwPayloadDecodeCopiesIpv4EndpointAddresses();
@@ -4313,6 +4410,7 @@ int main(int argc, char** argv) {
     TestProcessInfoCacheUsesCreationTimeOnRealCacheHits();
     TestProcessInfoFallbackRetriesByElapsedTime();
     TestProcessInfoCreationQueryFailuresAdvanceOnlyOncePerSecond();
+    TestProcessInfoProbePreservesRunningEndedAndUnknown();
     TestSingleInstanceGuardRejectsSecondOwnerAndReleasesName();
     TestEtwMonitorStartsOneConfiguredConsumer();
     TestEtwMonitorStopsOnlyOwnedResourcesAndStopIsIdempotent();
