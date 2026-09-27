@@ -41,6 +41,9 @@ private:
         std::chrono::steady_clock::time_point last_activity;
     };
 
+    bool EvictHistoricalEntriesLocked(
+        std::chrono::steady_clock::time_point observed_at);
+
     const std::size_t max_entries_;
     mutable std::mutex mutex_;
     std::map<ConnectionKey, Entry> entries_;

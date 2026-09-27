@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <set>
 #include <utility>
 
 namespace {
@@ -33,9 +34,11 @@ ConnectionAggregator::ConnectionAggregator(std::size_t max_entries) : max_entrie
 void ConnectionAggregator::Add(const ConnectionEvent& event) {
     std::lock_guard lock(mutex_);
     const auto existing = entries_.find(event.key);
-    if (existing == entries_.end() && entries_.size() == max_entries_) {
-        dropped_detail_events_ = SaturatingAdd(dropped_detail_events_, 1);
-        return;
+    if (existing == entries_.end() && entries_.size() >= max_entries_) {
+        if (max_entries_ == 0 || !EvictHistoricalEntriesLocked(event.observed_at)) {
+            dropped_detail_events_ = SaturatingAdd(dropped_detail_events_, 1);
+            return;
+        }
     }
 
     auto [iterator, inserted] = entries_.try_emplace(event.key);
@@ -49,6 +52,45 @@ void ConnectionAggregator::Add(const ConnectionEvent& event) {
     if (inserted || event.observed_at > entry.last_activity) {
         entry.last_activity = event.observed_at;
     }
+}
+
+bool ConnectionAggregator::EvictHistoricalEntriesLocked(
+    std::chrono::steady_clock::time_point observed_at) {
+    const auto cutoff = observed_at - std::chrono::seconds(5);
+    std::vector<std::pair<std::chrono::steady_clock::time_point, ConnectionKey>>
+        candidates;
+    candidates.reserve(entries_.size());
+    for (const auto& [key, entry] : entries_) {
+        if (entry.last_activity < cutoff) {
+            candidates.emplace_back(entry.last_activity, key);
+        }
+    }
+    if (candidates.empty()) {
+        return false;
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& left, const auto& right) {
+                  if (left.first != right.first) {
+                      return left.first < right.first;
+                  }
+                  return left.second < right.second;
+              });
+    const std::size_t batch_size = std::max<std::size_t>(1, max_entries_ / 20);
+    const std::size_t erase_count = std::min(batch_size, candidates.size());
+    std::set<ProcessInstanceId> affected_processes;
+    for (std::size_t index = 0; index < erase_count; ++index) {
+        affected_processes.insert(candidates[index].second.process);
+        entries_.erase(candidates[index].second);
+    }
+
+    for (const ProcessInstanceId process : affected_processes) {
+        const auto first = entries_.lower_bound(ConnectionKey{process});
+        if (first == entries_.end() || first->first.process != process) {
+            previous_snapshot_times_.erase(process);
+        }
+    }
+    return true;
 }
 
 std::vector<ConnectionSnapshot> ConnectionAggregator::Snapshot(

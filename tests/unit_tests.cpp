@@ -961,6 +961,141 @@ void TestConnectionAggregationBoundsEntriesAndClearsState() {
              0.0);
 }
 
+void TestConnectionCapacityEvictsOldestFivePercentDeterministically() {
+    ConnectionAggregator aggregator(40);
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const ProcessInstanceId process{108, 1};
+    for (std::uint16_t index = 0; index < 40; ++index) {
+        const auto key = MakeConnectionKey(
+            process, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls,
+            static_cast<std::uint16_t>(50000 + index), 443);
+        aggregator.Add({key, L"browser.exe", TrafficDirection::Send, 1, t0});
+    }
+    const auto admitted = MakeConnectionKey(
+        process, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls, 50100, 443);
+    aggregator.Add({admitted, L"browser.exe", TrafficDirection::Send, 5,
+                    t0 + std::chrono::seconds(10)});
+
+    const auto rows = aggregator.Snapshot(process, t0 + std::chrono::seconds(10));
+    CHECK_EQ(rows.size(), 39U);
+    CHECK_EQ(std::any_of(rows.begin(), rows.end(), [](const ConnectionSnapshot& row) {
+                 return row.key.local.port == 50000;
+             }),
+             false);
+    CHECK_EQ(std::any_of(rows.begin(), rows.end(), [](const ConnectionSnapshot& row) {
+                 return row.key.local.port == 50001;
+             }),
+             false);
+    CHECK_EQ(FindConnectionSnapshot(rows, admitted).sent_bytes, 5ULL);
+    CHECK_EQ(aggregator.dropped_detail_events(), 0ULL);
+}
+
+void TestConnectionCapacityEvictsAllAvailableWhenBatchIsLarger() {
+    ConnectionAggregator aggregator(40);
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const ProcessInstanceId process{109, 1};
+    for (std::uint16_t index = 0; index < 40; ++index) {
+        const auto key = MakeConnectionKey(
+            process, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls,
+            static_cast<std::uint16_t>(51000 + index), 443);
+        const auto observed =
+            index == 0 ? t0 : t0 + std::chrono::seconds(9);
+        aggregator.Add({key, L"browser.exe", TrafficDirection::Send, 1, observed});
+    }
+    const auto admitted = MakeConnectionKey(
+        process, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls, 51100, 443);
+    aggregator.Add({admitted, L"browser.exe", TrafficDirection::Send, 1,
+                    t0 + std::chrono::seconds(10)});
+
+    const auto rows = aggregator.Snapshot(process, t0 + std::chrono::seconds(10));
+    CHECK_EQ(rows.size(), 40U);
+    CHECK_EQ(std::any_of(rows.begin(), rows.end(), [](const ConnectionSnapshot& row) {
+                 return row.key.local.port == 51000;
+             }),
+             false);
+    CHECK_EQ(aggregator.dropped_detail_events(), 0ULL);
+}
+
+void TestConnectionCapacityKeepsCutoffAndRecentEntries() {
+    ConnectionAggregator aggregator(2);
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const ProcessInstanceId process{110, 1};
+    aggregator.Add({MakeConnectionKey(process, TransportProtocol::Tcp,
+                                      ApplicationProtocol::HttpsTls, 52000, 443),
+                    L"browser.exe", TrafficDirection::Send, 1,
+                    t0 + std::chrono::seconds(5)});
+    aggregator.Add({MakeConnectionKey(process, TransportProtocol::Tcp,
+                                      ApplicationProtocol::HttpsTls, 52001, 443),
+                    L"browser.exe", TrafficDirection::Send, 1,
+                    t0 + std::chrono::seconds(6)});
+    aggregator.Add({MakeConnectionKey(process, TransportProtocol::Tcp,
+                                      ApplicationProtocol::HttpsTls, 52002, 443),
+                    L"browser.exe", TrafficDirection::Send, 1,
+                    t0 + std::chrono::seconds(10)});
+
+    CHECK_EQ(aggregator.Snapshot(process, t0 + std::chrono::seconds(10)).size(), 2U);
+    CHECK_EQ(aggregator.dropped_detail_events(), 1ULL);
+
+    ConnectionAggregator zero_capacity(0);
+    zero_capacity.Add({MakeConnectionKey(process, TransportProtocol::Tcp,
+                                         ApplicationProtocol::HttpsTls, 52003, 443),
+                       L"browser.exe", TrafficDirection::Send, 1, t0});
+    CHECK_EQ(zero_capacity.Snapshot(process, t0).empty(), true);
+    CHECK_EQ(zero_capacity.dropped_detail_events(), 1ULL);
+}
+
+void TestConnectionCapacityClearsOnlyOrphanedProcessBaselines() {
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const ProcessInstanceId removed{111, 1};
+    const ProcessInstanceId replacement{112, 1};
+    const auto removed_key = MakeConnectionKey(
+        removed, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls, 53000, 443);
+    const auto replacement_key = MakeConnectionKey(
+        replacement, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls, 53001, 443);
+    ConnectionAggregator one_entry(1);
+    one_entry.Add({removed_key, L"old.exe", TrafficDirection::Send, 10, t0});
+    one_entry.Snapshot(removed, t0);
+    one_entry.Add({replacement_key, L"new.exe", TrafficDirection::Send, 1,
+                   t0 + std::chrono::seconds(10)});
+    one_entry.Add({removed_key, L"old.exe", TrafficDirection::Send, 5,
+                   t0 + std::chrono::seconds(20)});
+    const auto restored = one_entry.Snapshot(removed, t0 + std::chrono::seconds(21));
+    CHECK_EQ(restored.size(), 1U);
+    if (!restored.empty()) {
+        CHECK_EQ(restored[0].sent_bytes_per_second, 0.0);
+    }
+
+    ConnectionAggregator retained_baseline(20);
+    const ProcessInstanceId partial{113, 1};
+    const auto first = MakeConnectionKey(
+        partial, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls, 54000, 443);
+    const auto second = MakeConnectionKey(
+        partial, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls, 54001, 443);
+    retained_baseline.Add({first, L"partial.exe", TrafficDirection::Send, 10, t0});
+    retained_baseline.Add({second, L"partial.exe", TrafficDirection::Send, 10, t0});
+    for (std::uint16_t index = 0; index < 18; ++index) {
+        retained_baseline.Add({
+            MakeConnectionKey({static_cast<std::uint32_t>(200 + index), 1},
+                              TransportProtocol::Tcp, ApplicationProtocol::HttpsTls,
+                              static_cast<std::uint16_t>(54100 + index), 443),
+            L"other.exe", TrafficDirection::Send, 1,
+            t0 + std::chrono::seconds(9)});
+    }
+    retained_baseline.Snapshot(partial, t0 + std::chrono::seconds(5));
+    retained_baseline.Add({
+        MakeConnectionKey({999, 1}, TransportProtocol::Tcp,
+                          ApplicationProtocol::HttpsTls, 55000, 443),
+        L"new.exe", TrafficDirection::Send, 1, t0 + std::chrono::seconds(10)});
+    retained_baseline.Add({second, L"partial.exe", TrafficDirection::Send, 10,
+                           t0 + std::chrono::seconds(11)});
+    const auto partial_rows =
+        retained_baseline.Snapshot(partial, t0 + std::chrono::seconds(15));
+    CHECK_EQ(partial_rows.size(), 1U);
+    if (!partial_rows.empty()) {
+        CHECK_EQ(partial_rows[0].sent_bytes_per_second, 1.0);
+    }
+}
+
 void TestConnectionClearResetsProcessSnapshotTimeBaseline() {
     ConnectionAggregator aggregator;
     const auto t0 = std::chrono::steady_clock::time_point{};
@@ -4371,6 +4506,10 @@ int main(int argc, char** argv) {
     TestConnectionAggregationSaturatesDirectionalCounters();
     TestConnectionSnapshotsKeepProcessBaselinesIndependent();
     TestConnectionAggregationBoundsEntriesAndClearsState();
+    TestConnectionCapacityEvictsOldestFivePercentDeterministically();
+    TestConnectionCapacityEvictsAllAvailableWhenBatchIsLarger();
+    TestConnectionCapacityKeepsCutoffAndRecentEntries();
+    TestConnectionCapacityClearsOnlyOrphanedProcessBaselines();
     TestConnectionClearResetsProcessSnapshotTimeBaseline();
     TestConnectionRetentionUsesNewestActivityAndClearsBaseline();
     TestConnectionAggregationDefaultCapacityIsOneHundredThousand();
