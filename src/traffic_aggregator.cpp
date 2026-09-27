@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <set>
 #include <utility>
 
 namespace {
@@ -88,9 +89,24 @@ TrafficAggregator::LatestActivityByProcess() const {
 void TrafficAggregator::RemoveProcesses(
     std::span<const ProcessInstanceId> processes) {
     std::lock_guard lock(mutex_);
-    std::erase_if(entries_, [processes](const auto& item) {
-        return std::find(processes.begin(), processes.end(), item.first.process) !=
-               processes.end();
+    const std::set<ProcessInstanceId> selected(processes.begin(), processes.end());
+    std::erase_if(entries_, [&selected](const auto& item) {
+        return selected.contains(item.first.process);
+    });
+}
+
+void TrafficAggregator::RemoveProcessesInactiveBefore(
+    std::span<const ProcessInstanceId> processes,
+    std::chrono::steady_clock::time_point cutoff) {
+    std::lock_guard lock(mutex_);
+    std::set<ProcessInstanceId> removable(processes.begin(), processes.end());
+    for (const auto& [key, entry] : entries_) {
+        if (entry.last_activity >= cutoff) {
+            removable.erase(key.process);
+        }
+    }
+    std::erase_if(entries_, [&removable](const auto& item) {
+        return removable.contains(item.first.process);
     });
 }
 

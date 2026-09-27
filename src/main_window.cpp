@@ -596,8 +596,7 @@ private:
                 ended.push_back(process);
             }
         }
-        aggregator_.RemoveProcesses(ended);
-        connection_aggregator_.RemoveProcesses(ended);
+        monitor_.RemoveInactiveProcesses(ended, cutoff);
     }
 
     void RefreshRows() {

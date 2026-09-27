@@ -59,7 +59,6 @@ bool ConnectionAggregator::EvictHistoricalEntriesLocked(
     const auto cutoff = observed_at - std::chrono::seconds(5);
     std::vector<std::pair<std::chrono::steady_clock::time_point, ConnectionKey>>
         candidates;
-    candidates.reserve(entries_.size());
     for (const auto& [key, entry] : entries_) {
         if (entry.last_activity < cutoff) {
             candidates.emplace_back(entry.last_activity, key);
@@ -162,11 +161,29 @@ ConnectionAggregator::LatestActivityByProcess() const {
 void ConnectionAggregator::RemoveProcesses(
     std::span<const ProcessInstanceId> processes) {
     std::lock_guard lock(mutex_);
-    std::erase_if(entries_, [processes](const auto& item) {
-        return std::find(processes.begin(), processes.end(), item.first.process) !=
-               processes.end();
+    const std::set<ProcessInstanceId> selected(processes.begin(), processes.end());
+    std::erase_if(entries_, [&selected](const auto& item) {
+        return selected.contains(item.first.process);
     });
     for (const ProcessInstanceId process : processes) {
+        previous_snapshot_times_.erase(process);
+    }
+}
+
+void ConnectionAggregator::RemoveProcessesInactiveBefore(
+    std::span<const ProcessInstanceId> processes,
+    std::chrono::steady_clock::time_point cutoff) {
+    std::lock_guard lock(mutex_);
+    std::set<ProcessInstanceId> removable(processes.begin(), processes.end());
+    for (const auto& [key, entry] : entries_) {
+        if (entry.last_activity >= cutoff) {
+            removable.erase(key.process);
+        }
+    }
+    std::erase_if(entries_, [&removable](const auto& item) {
+        return removable.contains(item.first.process);
+    });
+    for (const ProcessInstanceId process : removable) {
         previous_snapshot_times_.erase(process);
     }
 }

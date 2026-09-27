@@ -28,6 +28,9 @@ public:
     std::map<ProcessInstanceId, std::chrono::steady_clock::time_point>
         LatestActivityByProcess() const;
     void RemoveProcesses(std::span<const ProcessInstanceId> processes);
+    void RemoveProcessesInactiveBefore(
+        std::span<const ProcessInstanceId> processes,
+        std::chrono::steady_clock::time_point cutoff);
     void ResetSnapshotBaseline(ProcessInstanceId process);
     void Clear();
     std::uint64_t dropped_detail_events() const;

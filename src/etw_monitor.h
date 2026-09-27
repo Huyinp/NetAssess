@@ -6,10 +6,12 @@
 #include "traffic_aggregator.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -70,6 +72,9 @@ public:
     bool running() const noexcept;
     bool cleanup_pending() const;
     void ClearStatistics();
+    void RemoveInactiveProcesses(
+        std::span<const ProcessInstanceId> processes,
+        std::chrono::steady_clock::time_point cutoff);
     EtwLossCounters loss_counters() const;
     std::uint64_t events_lost() const;
     std::uint64_t real_time_buffers_lost() const;

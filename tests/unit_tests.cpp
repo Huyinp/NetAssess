@@ -800,6 +800,26 @@ void TestTrafficRetentionRemovesOnlySelectedProcess() {
     }
 }
 
+void TestTrafficRetentionDoesNotRemoveNewActivityAfterCandidateScan() {
+    TrafficAggregator aggregator;
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const ProcessInstanceId process{105, 12};
+    const TrafficKey key{process, TransportProtocol::Tcp, ApplicationProtocol::Http};
+    aggregator.Add({key, L"race.exe", TrafficDirection::Send, 1, t0});
+    const auto cutoff = t0 + std::chrono::seconds(10);
+    const auto candidates = aggregator.ProcessesInactiveBefore(cutoff);
+    CHECK_EQ(candidates.size(), 1U);
+
+    aggregator.Add({key, L"race.exe", TrafficDirection::Send, 2, cutoff});
+    aggregator.RemoveProcessesInactiveBefore(candidates, cutoff);
+
+    const auto rows = aggregator.Snapshot(cutoff);
+    CHECK_EQ(rows.size(), 1U);
+    if (!rows.empty()) {
+        CHECK_EQ(rows[0].sent_bytes, 3ULL);
+    }
+}
+
 void TestConnectionAggregationUsesAllEndpointAndProtocolFields() {
     ConnectionAggregator aggregator;
     const ProcessInstanceId process{100, 1};
@@ -1156,6 +1176,27 @@ void TestConnectionRetentionUsesNewestActivityAndClearsBaseline() {
     CHECK_EQ(restored.size(), 1U);
     if (!restored.empty()) {
         CHECK_EQ(restored[0].sent_bytes_per_second, 0.0);
+    }
+}
+
+void TestConnectionRetentionDoesNotRemoveNewActivityAfterCandidateScan() {
+    ConnectionAggregator aggregator;
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const ProcessInstanceId process{114, 1};
+    const auto key = MakeConnectionKey(
+        process, TransportProtocol::Tcp, ApplicationProtocol::HttpsTls, 56000, 443);
+    aggregator.Add({key, L"race.exe", TrafficDirection::Send, 1, t0});
+    const auto cutoff = t0 + std::chrono::seconds(10);
+    const auto candidates = aggregator.ProcessesInactiveBefore(cutoff);
+    CHECK_EQ(candidates.size(), 1U);
+
+    aggregator.Add({key, L"race.exe", TrafficDirection::Send, 2, cutoff});
+    aggregator.RemoveProcessesInactiveBefore(candidates, cutoff);
+
+    const auto rows = aggregator.Snapshot(process, cutoff);
+    CHECK_EQ(rows.size(), 1U);
+    if (!rows.empty()) {
+        CHECK_EQ(rows[0].sent_bytes, 3ULL);
     }
 }
 
@@ -2361,6 +2402,29 @@ void TestEtwMonitorStartsOneConfiguredConsumer() {
     CHECK_EQ(api.open_trace_calls, 1);
     CHECK_EQ(api.process_trace_calls, 1);
     monitor.Stop();
+}
+
+void TestEtwMonitorRetentionRechecksLatestActivityAcrossBothAggregators() {
+    TrafficAggregator traffic;
+    ConnectionAggregator connections;
+    ProcessInfoCache cache;
+    FakeEtwSessionApi api;
+    EtwMonitor monitor(traffic, connections, cache, api);
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    const auto cutoff = t0 + std::chrono::seconds(10);
+    const ProcessInstanceId process{4325, 1};
+    traffic.Add({{process, TransportProtocol::Tcp, ApplicationProtocol::Http},
+                 L"race.exe", TrafficDirection::Send, 1, t0});
+    const auto connection = MakeConnectionKey(
+        process, TransportProtocol::Tcp, ApplicationProtocol::Http, 57000, 80);
+    connections.Add({connection, L"race.exe", TrafficDirection::Send, 1, t0});
+    const std::array candidates{process};
+
+    connections.Add({connection, L"race.exe", TrafficDirection::Send, 2, cutoff});
+    monitor.RemoveInactiveProcesses(candidates, cutoff);
+
+    CHECK_EQ(traffic.Snapshot(cutoff).size(), 1U);
+    CHECK_EQ(connections.Snapshot(process, cutoff).size(), 1U);
 }
 
 void TestEtwMonitorStopsOnlyOwnedResourcesAndStopIsIdempotent() {
@@ -4634,6 +4698,7 @@ int main(int argc, char** argv) {
     TestTrafficAggregationKeepsDistinctKeysAndDirectionsSeparate();
     TestTrafficAggregationKeepsNewestActivityPerProcess();
     TestTrafficRetentionRemovesOnlySelectedProcess();
+    TestTrafficRetentionDoesNotRemoveNewActivityAfterCandidateScan();
     TestConnectionAggregationUsesAllEndpointAndProtocolFields();
     TestConnectionAggregationSaturatesDirectionalCounters();
     TestConnectionSnapshotsKeepProcessBaselinesIndependent();
@@ -4644,6 +4709,7 @@ int main(int argc, char** argv) {
     TestConnectionCapacityClearsOnlyOrphanedProcessBaselines();
     TestConnectionClearResetsProcessSnapshotTimeBaseline();
     TestConnectionRetentionUsesNewestActivityAndClearsBaseline();
+    TestConnectionRetentionDoesNotRemoveNewActivityAfterCandidateScan();
     TestConnectionAggregationDefaultCapacityIsOneHundredThousand();
     TestEtwPayloadDecodeIsBoundedAndUsesNetworkOrderPorts();
     TestEtwPayloadDecodeCopiesIpv4EndpointAddresses();
@@ -4685,6 +4751,7 @@ int main(int argc, char** argv) {
     TestProcessInfoProbePreservesRunningEndedAndUnknown();
     TestSingleInstanceGuardRejectsSecondOwnerAndReleasesName();
     TestEtwMonitorStartsOneConfiguredConsumer();
+    TestEtwMonitorRetentionRechecksLatestActivityAcrossBothAggregators();
     TestEtwMonitorStopsOnlyOwnedResourcesAndStopIsIdempotent();
     TestEtwMonitorExposesStartTraceFailureWithoutOpeningConsumer();
     TestEtwMonitorCleansOnlyLegacyNetAssessSessionsAndRetriesResourceFailure();

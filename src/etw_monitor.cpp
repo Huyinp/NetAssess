@@ -312,6 +312,32 @@ void EtwMonitor::ClearStatistics() {
     connection_aggregator_.Clear();
 }
 
+void EtwMonitor::RemoveInactiveProcesses(
+    std::span<const ProcessInstanceId> processes,
+    std::chrono::steady_clock::time_point cutoff) {
+    std::lock_guard lock(statistics_mutex_);
+    auto latest_activity = aggregator_.LatestActivityByProcess();
+    for (const auto& [process, connection_activity] :
+         connection_aggregator_.LatestActivityByProcess()) {
+        auto [position, inserted] =
+            latest_activity.try_emplace(process, connection_activity);
+        if (!inserted) {
+            position->second = std::max(position->second, connection_activity);
+        }
+    }
+
+    std::vector<ProcessInstanceId> removable;
+    removable.reserve(processes.size());
+    for (const ProcessInstanceId process : processes) {
+        const auto activity = latest_activity.find(process);
+        if (activity == latest_activity.end() || activity->second < cutoff) {
+            removable.push_back(process);
+        }
+    }
+    aggregator_.RemoveProcesses(removable);
+    connection_aggregator_.RemoveProcesses(removable);
+}
+
 EtwLossCounters EtwMonitor::loss_counters() const {
     std::lock_guard transition_lock(transition_mutex_);
     std::lock_guard api_lock(api_mutex_);
